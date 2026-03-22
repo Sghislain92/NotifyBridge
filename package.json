@@ -1,0 +1,11 @@
+{
+  "name": "notify-bridge",
+  "version": "1.0.0",
+  "description": "WhatsApp API Bridge for Business Notifications",
+  "main": "api-legacy.js",
+  "dependencies": {
+    "express": "^4.18.2",
+    "whatsapp-web.js": "1.34.6",
+    "qrcode": "^1.5.3"
+  }
+}
