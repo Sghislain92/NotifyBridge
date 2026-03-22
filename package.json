@@ -1,11 +1,11 @@
 {
   "name": "notify-bridge",
-  "version": "1.1.0",
-  "description": "WhatsApp API Bridge for Business Notifications with Stealth Mode",
-  "main": "api-legacy.js",
+  "version": "3.0.0",
+  "description": "WhatsApp API Bridge with Stealth Mode, Database Persistence, and Unified Message Sending",
+  "main": "api-legacy-final.js",
   "scripts": {
-    "start": "node api-legacy.js",
-    "dev": "nodemon api-legacy.js"
+    "start": "node api-legacy-final.js",
+    "dev": "nodemon api-legacy-final.js"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -13,9 +13,15 @@
     "qrcode": "^1.5.3",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "jsonwebtoken": "^9.1.2",
+    "axios": "^1.6.5",
+    "mysql2": "^3.6.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
