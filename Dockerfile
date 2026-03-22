@@ -32,3 +32,6 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
 EXPOSE 3000
 CMD ["node", "api-legacy.js"]
+
+
+RUN mkdir -p .wwebjs_auth && chmod 777 .wwebjs_auth
