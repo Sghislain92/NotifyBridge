@@ -14,7 +14,7 @@
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "cors": "^2.8.5",
-    "jsonwebtoken": "^9.1.2",
+    "jsonwebtoken": "^9.0.2",
     "axios": "^1.6.5",
     "mysql2": "^3.6.5"
   },
