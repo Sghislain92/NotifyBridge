@@ -8,6 +8,8 @@ const axios = require('axios');
 
 /**
  * CONFIGURATION STEALTH AVANCÉE
+ * Le plugin Stealth masque les variables Puppeteer qui trahissent l'automatisation
+ * (navigator.webdriver, chrome.runtime, etc.)
  */
 puppeteer.use(StealthPlugin());
 
@@ -16,16 +18,17 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb' }));
 app.use(cors());
 
-// ============================================
-// STOCKAGE EN MÉMOIRE (Sessions + Messages)
-// ============================================
-
-// Stockage des sessions actives
 const sessions = {};
-
-// Stockage des messages avec leurs statuts
-// Structure: { messageId: { to, text, status, timestamp, ack } }
 const messageTracking = {};
+const API_KEY = "BWxD1xkzuPxJ0luWnsaECtn3CVZkYG6dtNUxnwUsBWWwYwvkKYl1ZZWnDuP6M";
+
+// Middleware d'authentification
+app.use((req, res, next) => {
+    if (req.headers["x-api-key"] !== API_KEY) {
+        return res.status(401).json({ error: "Authentification API échouée" });
+    }
+    next();
+});
 
 // ============================================
 // UTILITAIRES
@@ -97,268 +100,220 @@ function getMessageStatus(ack) {
 }
 
 // ============================================
-// ENDPOINTS
+// ENDPOINTS DE SESSIONS (CODE ORIGINAL QUI FONCTIONNE)
 // ============================================
 
 /**
+ * POST /api/sessions/:sessionId/start
+ * Démarre une nouvelle session WhatsApp avec mode Stealth
+ */
+app.post("/api/sessions/:sessionId/start", async (req, res) => {
+    const sessionId = req.params.sessionId;
+
+    // 1. Nettoyage préventif si une session existe déjà
+    if (sessions[sessionId] && sessions[sessionId].client) {
+        console.log(`[${sessionId}] Fermeture de l'ancienne instance...`);
+        try {
+            await sessions[sessionId].client.destroy();
+        } catch (e) {
+            console.error(`[${sessionId}] Erreur lors de la destruction :`, e.message);
+        }
+    }
+
+    sessions[sessionId] = { 
+        client: null, 
+        status: "STARTING", 
+        qr: null,
+        phoneNumber: null,
+        messages: {}
+    };
+
+    // 2. Initialisation du client avec stratégie de camouflage maximale
+    const client = new Client({
+        authStrategy: new LocalAuth({ 
+            clientId: sessionId,
+            dataPath: './.wwebjs_auth' // Dossier persistant (doit être créé dans le Dockerfile)
+        }),
+        // Forçage d'une version Web stable pour éviter les incompatibilités de détection
+        webVersionCache: { 
+            type: 'remote', 
+            remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1035691214-alpha.html' 
+        },
+        puppeteer: {
+            headless: true,
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--disable-infobars',
+                '--window-position=0,0',
+                '--ignore-certificate-errors',
+                '--ignore-certificate-errors-spki-list',
+                '--disable-extensions',
+                // User-Agent Windows récent pour paraître "humain"
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            ]
+        }
+    });
+
+    // 3. Gestion des événements
+    client.on('qr', async (qr) => {
+        try {
+            const qrCodeBase64 = await qrcode.toDataURL(qr);
+            sessions[sessionId].qr = qrCodeBase64;
+            sessions[sessionId].status = "SCAN_QR";
+            console.log(`[${sessionId}] QR Code généré - En attente de scan...`);
+        } catch (err) {
+            console.error(`[${sessionId}] Erreur génération QR :`, err);
+        }
+    });
+
+    client.on('ready', () => { 
+        sessions[sessionId].status = "WORKING"; 
+        sessions[sessionId].qr = null;
+        sessions[sessionId].phoneNumber = client.info.wid.user;
+        console.log(`[${sessionId}] ✅ Session opérationnelle ! Numéro: ${sessions[sessionId].phoneNumber}`);
+    });
+
+    client.on('authenticated', () => {
+        console.log(`[${sessionId}] 🔓 Authentification réussie`);
+    });
+
+    client.on('auth_failure', msg => {
+        console.error(`[${sessionId}] ❌ Échec d'authentification :`, msg);
+        sessions[sessionId].status = "AUTH_FAILURE";
+    });
+
+    client.on('disconnected', (reason) => {
+        console.log(`[${sessionId}] 🔌 Déconnecté :`, reason);
+        sessions[sessionId].status = "DISCONNECTED";
+    });
+
+    // Événement: Changement de statut de message (ACK)
+    client.on('message_ack', (msg, ack) => {
+        try {
+            const messageId = msg.id.id;
+            const status = getMessageStatus(ack);
+            
+            // Enregistrer le changement de statut
+            if (messageTracking[messageId]) {
+                messageTracking[messageId].status = status;
+                messageTracking[messageId].ack = ack;
+                messageTracking[messageId].lastUpdate = new Date();
+            }
+
+            // Aussi enregistrer dans la session
+            if (sessions[sessionId] && sessions[sessionId].messages[messageId]) {
+                sessions[sessionId].messages[messageId].status = status;
+                sessions[sessionId].messages[messageId].ack = ack;
+            }
+
+            console.log(`[${sessionId}] Message ${messageId}: ${status}`);
+        } catch (err) {
+            console.error(`[${sessionId}] Erreur message_ack:`, err);
+        }
+    });
+
+    // 4. Lancement
+    sessions[sessionId].client = client;
+    client.initialize().catch(err => {
+        console.error(`[${sessionId}] Erreur fatale initialisation :`, err);
+        sessions[sessionId].status = "ERROR";
+    });
+
+    res.json({ 
+        ok: true, 
+        message: "Initialisation de la session WhatsApp lancée en mode Stealth",
+        sessionId: sessionId 
+    });
+});
+
+/**
+ * GET /api/sessions/:sessionId/qr
+ * Récupère le QR code et le statut de la session
+ */
+app.get("/api/sessions/:sessionId/qr", (req, res) => {
+    const session = sessions[req.params.sessionId];
+    if (!session) return res.status(404).json({ error: "Session non trouvée" });
+    
+    if (session.status === "WORKING") {
+        return res.json({ 
+            ok: true,
+            status: "WORKING", 
+            message: "Déjà connecté",
+            phoneNumber: session.phoneNumber
+        });
+    }
+    
+    if (!session.qr) {
+        return res.json({ 
+            ok: true,
+            status: session.status, 
+            message: "QR non encore disponible" 
+        });
+    }
+    
+    res.json({ 
+        ok: true,
+        qr: session.qr, 
+        status: session.status 
+    });
+});
+
+/**
+ * GET /api/sessions/:sessionId/status
+ * Vérifie le statut d'une session
+ */
+app.get("/api/sessions/:sessionId/status", (req, res) => {
+    const session = sessions[req.params.sessionId];
+    if (!session) return res.status(404).json({ error: "Session non trouvée" });
+    res.json({ 
+        ok: true,
+        status: session.status,
+        phoneNumber: session.phoneNumber
+    });
+});
+
+/**
+ * DELETE /api/sessions/:sessionId
+ * Détruit une session
+ */
+app.delete("/api/sessions/:sessionId", async (req, res) => {
+    const session = sessions[req.params.sessionId];
+    if (!session) return res.status(404).json({ error: "Session non trouvée" });
+    
+    try {
+        if (session.client) {
+            await session.client.destroy();
+        }
+        delete sessions[req.params.sessionId];
+        res.json({ ok: true, message: "Session détruite" });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
  * GET /api/health
- * Vérifier que l'API fonctionne
+ * Vérification de santé de l'API
  */
 app.get("/api/health", (req, res) => {
-    res.json({
-        status: "ok",
+    res.json({ 
+        ok: true,
+        status: "ok", 
         timestamp: new Date().toISOString(),
         activeSessions: Object.keys(sessions).length,
         trackedMessages: Object.keys(messageTracking).length
     });
 });
 
-/**
- * POST /api/sessions/:sessionId/start
- * Démarre une nouvelle session WhatsApp
- */
-app.post("/api/sessions/:sessionId/start", async (req, res) => {
-    try {
-        const sessionId = req.params.sessionId;
-
-        console.log(`[Session ${sessionId}] Démarrage...`);
-
-        // Nettoyage si une session existe déjà
-        if (sessions[sessionId] && sessions[sessionId].client) {
-            console.log(`[Session ${sessionId}] Fermeture de l'ancienne instance...`);
-            try {
-                await sessions[sessionId].client.destroy();
-            } catch (e) {
-                console.error(`[Session ${sessionId}] Erreur destruction:`, e.message);
-            }
-        }
-
-        // Initialisation de la session
-        sessions[sessionId] = {
-            client: null,
-            status: "STARTING",
-            qr: null,
-            phoneNumber: null,
-            createdAt: new Date(),
-            messages: {}
-        };
-
-        // Création du client WhatsApp
-        const client = new Client({
-            authStrategy: new LocalAuth({
-                clientId: `session-${sessionId}`,
-                dataPath: './.wwebjs_auth'
-            }),
-            webVersionCache: {
-                type: 'remote',
-                remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1035691214-alpha.html'
-            },
-            puppeteer: {
-                headless: true,
-                executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--disable-gpu',
-                    '--disable-infobars',
-                    '--window-position=0,0',
-                    '--ignore-certificate-errors',
-                    '--ignore-certificate-errors-spki-list',
-                    '--disable-extensions',
-                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-                ]
-            }
-        });
-
-        // Événement: QR Code généré
-        client.on('qr', async (qr) => {
-            try {
-                const qrCodeBase64 = await qrcode.toDataURL(qr);
-                sessions[sessionId].qr = qrCodeBase64;
-                sessions[sessionId].status = "SCAN_QR";
-                console.log(`[Session ${sessionId}] QR Code généré`);
-            } catch (err) {
-                console.error(`[Session ${sessionId}] Erreur QR:`, err);
-            }
-        });
-
-        // Événement: Client prêt
-        client.on('ready', async () => {
-            try {
-                const phoneNumber = client.info.wid.user;
-                sessions[sessionId].status = "WORKING";
-                sessions[sessionId].qr = null;
-                sessions[sessionId].phoneNumber = phoneNumber;
-                console.log(`[Session ${sessionId}] ✅ Session opérationnelle! Numéro: ${phoneNumber}`);
-            } catch (err) {
-                console.error(`[Session ${sessionId}] Erreur ready:`, err);
-            }
-        });
-
-        // Événement: Authentification réussie
-        client.on('authenticated', async () => {
-            console.log(`[Session ${sessionId}] 🔓 Authentification réussie`);
-        });
-
-        // Événement: Échec d'authentification
-        client.on('auth_failure', async (msg) => {
-            try {
-                sessions[sessionId].status = "AUTH_FAILURE";
-                console.error(`[Session ${sessionId}] ❌ Échec auth:`, msg);
-            } catch (err) {
-                console.error(`[Session ${sessionId}] Erreur auth_failure:`, err);
-            }
-        });
-
-        // Événement: Déconnexion
-        client.on('disconnected', async (reason) => {
-            try {
-                sessions[sessionId].status = "DISCONNECTED";
-                console.log(`[Session ${sessionId}] 🔌 Déconnecté:`, reason);
-            } catch (err) {
-                console.error(`[Session ${sessionId}] Erreur disconnected:`, err);
-            }
-        });
-
-        // Événement: Changement de statut de message (ACK)
-        client.on('message_ack', (msg, ack) => {
-            try {
-                const messageId = msg.id.id;
-                const status = getMessageStatus(ack);
-                
-                // Enregistrer le changement de statut
-                if (messageTracking[messageId]) {
-                    messageTracking[messageId].status = status;
-                    messageTracking[messageId].ack = ack;
-                    messageTracking[messageId].lastUpdate = new Date();
-                }
-
-                // Aussi enregistrer dans la session
-                if (sessions[sessionId] && sessions[sessionId].messages[messageId]) {
-                    sessions[sessionId].messages[messageId].status = status;
-                    sessions[sessionId].messages[messageId].ack = ack;
-                }
-
-                console.log(`[Session ${sessionId}] Message ${messageId}: ${status}`);
-            } catch (err) {
-                console.error(`[Session ${sessionId}] Erreur message_ack:`, err);
-            }
-        });
-
-        // Initialisation du client
-        sessions[sessionId].client = client;
-        client.initialize().catch(err => {
-            console.error(`[Session ${sessionId}] Erreur init:`, err);
-            sessions[sessionId].status = "ERROR";
-        });
-
-        res.json({
-            ok: true,
-            message: "Session initialisée",
-            sessionId: sessionId,
-            status: "STARTING"
-        });
-    } catch (err) {
-        console.error('Erreur démarrage session:', err);
-        res.status(500).json({ ok: false, error: err.message });
-    }
-});
-
-/**
- * GET /api/sessions/:sessionId/qr
- * Récupère le QR code
- */
-app.get("/api/sessions/:sessionId/qr", (req, res) => {
-    const sessionId = req.params.sessionId;
-    const session = sessions[sessionId];
-    
-    if (!session) {
-        return res.status(404).json({ ok: false, error: "Session non trouvée" });
-    }
-
-    if (session.status === "WORKING") {
-        return res.json({
-            ok: true,
-            status: "WORKING",
-            message: "Déjà connecté",
-            phoneNumber: session.phoneNumber
-        });
-    }
-
-    if (!session.qr) {
-        return res.json({
-            ok: true,
-            status: session.status,
-            message: "QR non disponible",
-            qr: null
-        });
-    }
-
-    res.json({
-        ok: true,
-        status: session.status,
-        qr: session.qr
-    });
-});
-
-/**
- * GET /api/sessions/:sessionId/status
- * Récupère le statut de la session
- */
-app.get("/api/sessions/:sessionId/status", (req, res) => {
-    const sessionId = req.params.sessionId;
-    const session = sessions[sessionId];
-    
-    if (!session) {
-        return res.status(404).json({ ok: false, error: "Session non trouvée" });
-    }
-    
-    res.json({
-        ok: true,
-        sessionId: sessionId,
-        status: session.status,
-        phoneNumber: session.phoneNumber,
-        createdAt: session.createdAt,
-        messagesTracked: Object.keys(session.messages).length
-    });
-});
-
-/**
- * DELETE /api/sessions/:sessionId
- * Déconnecte et supprime la session
- */
-app.delete("/api/sessions/:sessionId", async (req, res) => {
-    try {
-        const sessionId = req.params.sessionId;
-        const session = sessions[sessionId];
-        
-        if (!session) {
-            return res.status(404).json({ ok: false, error: "Session non trouvée" });
-        }
-
-        if (session.client) {
-            await session.client.destroy();
-        }
-
-        delete sessions[sessionId];
-
-        res.json({
-            ok: true,
-            message: "Session détruite",
-            sessionId: sessionId
-        });
-    } catch (err) {
-        console.error('Erreur suppression session:', err);
-        res.status(500).json({ ok: false, error: err.message });
-    }
-});
-
 // ============================================
-// ENDPOINT UNIFIÉ D'ENVOI DE MESSAGES
+// ENDPOINTS D'ENVOI DE MESSAGES (NOUVEAUX)
 // ============================================
 
 /**
@@ -685,7 +640,6 @@ app.get("/api/stats", (req, res) => {
             sessionId,
             status: session.status,
             phoneNumber: session.phoneNumber,
-            createdAt: session.createdAt,
             messagesCount: Object.keys(session.messages || {}).length
         }))
     };
@@ -703,9 +657,8 @@ app.get("/api/stats", (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    console.log(`\n🚀 NotifyBridge API STATELESS prête sur le port ${port}`);
+    console.log(`\n🚀 NotifyBridge API WORKING prête sur le port ${port}`);
     console.log(`📍 Base URL: http://localhost:${port}`);
-    console.log(`🔓 Pas d'authentification (gérée en PHP)`);
-    console.log(`💾 Pas de BD (gérée en PHP)`);
+    console.log(`🔐 Authentification: API Key requis`);
     console.log(`📊 Polling des statuts de messages disponible\n`);
 });
