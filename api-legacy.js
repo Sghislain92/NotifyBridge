@@ -14,8 +14,7 @@ const axios = require('axios');
 puppeteer.use(StealthPlugin());
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb' }));
+app.use(express.json());
 app.use(cors());
 
 const sessions = {};
@@ -34,9 +33,6 @@ app.use((req, res, next) => {
 // UTILITAIRES
 // ============================================
 
-/**
- * Télécharge un fichier depuis une URL
- */
 async function downloadFile(url) {
     try {
         const response = await axios.get(url, { responseType: 'arraybuffer' });
@@ -46,9 +42,6 @@ async function downloadFile(url) {
     }
 }
 
-/**
- * Crée un MessageMedia à partir d'une URL
- */
 async function createMessageMedia(mediaUrl, mediaType) {
     try {
         const buffer = await downloadFile(mediaUrl);
@@ -59,9 +52,6 @@ async function createMessageMedia(mediaUrl, mediaType) {
     }
 }
 
-/**
- * Récupère le type MIME à partir de l'extension de fichier
- */
 function getMimeType(url) {
     const ext = url.split('.').pop().toLowerCase();
     const mimeTypes = {
@@ -85,9 +75,6 @@ function getMimeType(url) {
     return mimeTypes[ext] || 'application/octet-stream';
 }
 
-/**
- * Convertit les codes ACK WhatsApp en statuts lisibles
- */
 function getMessageStatus(ack) {
     const statusMap = {
         0: 'pending',
@@ -99,13 +86,10 @@ function getMessageStatus(ack) {
     return statusMap[ack] || 'unknown';
 }
 
-// ============================================
-// ENDPOINTS DE SESSIONS (CODE ORIGINAL QUI FONCTIONNE)
-// ============================================
-
 /**
  * POST /api/sessions/:sessionId/start
  * Démarre une nouvelle session WhatsApp avec mode Stealth
+ * CODE ORIGINAL QUI FONCTIONNE
  */
 app.post("/api/sessions/:sessionId/start", async (req, res) => {
     const sessionId = req.params.sessionId;
@@ -120,13 +104,7 @@ app.post("/api/sessions/:sessionId/start", async (req, res) => {
         }
     }
 
-    sessions[sessionId] = { 
-        client: null, 
-        status: "STARTING", 
-        qr: null,
-        phoneNumber: null,
-        messages: {}
-    };
+    sessions[sessionId] = { client: null, status: "STARTING", qr: null, phoneNumber: null, messages: {} };
 
     // 2. Initialisation du client avec stratégie de camouflage maximale
     const client = new Client({
@@ -175,7 +153,7 @@ app.post("/api/sessions/:sessionId/start", async (req, res) => {
 
     client.on('ready', () => { 
         sessions[sessionId].status = "WORKING"; 
-        sessions[sessionId].qr = null;
+        sessions[sessionId].qr = null; 
         sessions[sessionId].phoneNumber = client.info.wid.user;
         console.log(`[${sessionId}] ✅ Session opérationnelle ! Numéro: ${sessions[sessionId].phoneNumber}`);
     });
@@ -242,27 +220,14 @@ app.get("/api/sessions/:sessionId/qr", (req, res) => {
     if (!session) return res.status(404).json({ error: "Session non trouvée" });
     
     if (session.status === "WORKING") {
-        return res.json({ 
-            ok: true,
-            status: "WORKING", 
-            message: "Déjà connecté",
-            phoneNumber: session.phoneNumber
-        });
+        return res.json({ status: "WORKING", message: "Déjà connecté", phoneNumber: session.phoneNumber });
     }
     
     if (!session.qr) {
-        return res.json({ 
-            ok: true,
-            status: session.status, 
-            message: "QR non encore disponible" 
-        });
+        return res.json({ status: session.status, message: "QR non encore disponible" });
     }
     
-    res.json({ 
-        ok: true,
-        qr: session.qr, 
-        status: session.status 
-    });
+    res.json({ qr: session.qr, status: session.status });
 });
 
 /**
@@ -272,11 +237,7 @@ app.get("/api/sessions/:sessionId/qr", (req, res) => {
 app.get("/api/sessions/:sessionId/status", (req, res) => {
     const session = sessions[req.params.sessionId];
     if (!session) return res.status(404).json({ error: "Session non trouvée" });
-    res.json({ 
-        ok: true,
-        status: session.status,
-        phoneNumber: session.phoneNumber
-    });
+    res.json({ status: session.status, phoneNumber: session.phoneNumber });
 });
 
 /**
@@ -303,17 +264,11 @@ app.delete("/api/sessions/:sessionId", async (req, res) => {
  * Vérification de santé de l'API
  */
 app.get("/api/health", (req, res) => {
-    res.json({ 
-        ok: true,
-        status: "ok", 
-        timestamp: new Date().toISOString(),
-        activeSessions: Object.keys(sessions).length,
-        trackedMessages: Object.keys(messageTracking).length
-    });
+    res.json({ status: "ok", timestamp: new Date().toISOString(), activeSessions: Object.keys(sessions).length });
 });
 
 // ============================================
-// ENDPOINTS D'ENVOI DE MESSAGES (NOUVEAUX)
+// ENDPOINTS D'ENVOI DE MESSAGES (AJOUTÉS MINIMALEMENT)
 // ============================================
 
 /**
@@ -657,8 +612,10 @@ app.get("/api/stats", (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    console.log(`\n🚀 NotifyBridge API WORKING prête sur le port ${port}`);
-    console.log(`📍 Base URL: http://localhost:${port}`);
-    console.log(`🔐 Authentification: API Key requis`);
-    console.log(`📊 Polling des statuts de messages disponible\n`);
+    console.log(`\n🚀 NotifyBridge Stealth API FINAL prête sur le port ${port}`);
+    console.log(`📍 Endpoint de démarrage : POST http://localhost:${port}/api/sessions/VOTRE_ID/start`);
+    console.log(`📍 Récupérer QR : GET http://localhost:${port}/api/sessions/VOTRE_ID/qr`);
+    console.log(`📍 Vérifier statut : GET http://localhost:${port}/api/sessions/VOTRE_ID/status`);
+    console.log(`📍 Envoyer message : POST http://localhost:${port}/api/messages/send`);
+    console.log(`📍 Suivi message : GET http://localhost:${port}/api/messages/MESSAGE_ID/status\n`);
 });
