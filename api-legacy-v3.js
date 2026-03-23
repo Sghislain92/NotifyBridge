@@ -73,7 +73,14 @@ async function createClient(sessionId) {
       const session = sessions.get(sessionId);
       if (session) {
         session.status = 'SCAN_QR';
-        session.qr = qr;
+        // Convertir le QR en format data:image/png;base64
+        try {
+          const qrImage = await qrcode.toDataURL(qr);
+          session.qr = qrImage;
+        } catch (e) {
+          console.error(`[${sessionId}] Erreur conversion QR:`, e.message);
+          session.qr = qr; // Fallback
+        }
         session.lastActivity = Date.now();
       }
     });
@@ -97,13 +104,136 @@ async function createClient(sessionId) {
       }
     });
 
-    client.on('ready', () => {
+    client.on('ready', async () => {
       console.log(`[${sessionId}] ✅ Client prêt`);
       const session = sessions.get(sessionId);
       if (session) {
         session.status = 'WORKING';
-        session.phoneNumber = client.info.wid.user;
         session.lastActivity = Date.now();
+        
+        try {
+          // ============================================
+          // RÉCUPÉRER TOUTES LES INFORMATIONS
+          // ============================================
+          
+          // 1. Informations de base (synchrones)
+          const wid = {
+            serialized: client.info.wid._serialized,
+            user: client.info.wid.user,
+            server: client.info.wid.server
+          };
+          
+          // 2. Informations personnelles
+          const personal = {
+            pushname: client.info.pushname,
+            platform: client.info.platform
+          };
+          
+          // 3. Informations du téléphone
+          const phone = {
+            wa_version: client.info.phone.wa_version,
+            os_version: client.info.phone.os_version,
+            device_manufacturer: client.info.phone.device_manufacturer,
+            device_model: client.info.phone.device_model,
+            os_build_number: client.info.phone.os_build_number
+          };
+          
+          // 4. Batterie du téléphone
+          let battery = null;
+          try {
+            const batteryStatus = await client.getBatteryStatus();
+            battery = {
+              percentage: batteryStatus.battery,
+              plugged: batteryStatus.plugged
+            };
+          } catch (e) {
+            console.log(`[${sessionId}] Batterie non disponible (normal sur Web/Windows)`);
+          }
+          
+          // 5. Récupérer le contact de l'utilisateur connecté
+          const contact = await client.getContactById(wid.serialized);
+          
+          const contactInfo = {
+            id: contact.id._serialized,
+            number: contact.number,
+            name: contact.name,
+            pushname: contact.pushname,
+            shortName: contact.shortName,
+            isMe: contact.isMe,
+            isMyContact: contact.isMyContact,
+            isUser: contact.isUser,
+            isWAContact: contact.isWAContact,
+            isBlocked: contact.isBlocked,
+            isGroup: contact.isGroup,
+            isBusiness: contact.isBusiness,
+            isEnterprise: contact.isEnterprise
+          };
+          
+          // 6. Récupérer les informations asynchrones
+          let countryCode = null;
+          let formattedNumber = null;
+          let profilePicUrl = null;
+          let about = null;
+          let commonGroups = null;
+          
+          try {
+            countryCode = await contact.getCountryCode();
+          } catch (e) {
+            console.log(`[${sessionId}] Code pays non disponible`);
+          }
+          
+          try {
+            formattedNumber = await contact.getFormattedNumber();
+          } catch (e) {
+            console.log(`[${sessionId}] Numéro formaté non disponible`);
+          }
+          
+          try {
+            profilePicUrl = await contact.getProfilePicUrl();
+          } catch (e) {
+            console.log(`[${sessionId}] Photo de profil non disponible`);
+          }
+          
+          try {
+            about = await contact.getAbout();
+          } catch (e) {
+            console.log(`[${sessionId}] Statut non disponible`);
+          }
+          
+          try {
+            commonGroups = await contact.getCommonGroups();
+          } catch (e) {
+            console.log(`[${sessionId}] Groupes en commun non disponibles`);
+          }
+          
+          // 7. Stocker toutes les informations dans la session
+          session.phoneNumber = wid.serialized;
+          session.userInfo = {
+            wid,
+            personal,
+            phone,
+            battery
+          };
+          
+          session.contactInfo = {
+            ...contactInfo,
+            countryCode,
+            formattedNumber,
+            profilePicUrl,
+            about,
+            commonGroupsCount: commonGroups ? commonGroups.length : 0
+          };
+          
+          console.log(`[${sessionId}] ✅ Toutes les informations récupérées`);
+          console.log(`[${sessionId}] Numéro: ${wid.user}`);
+          console.log(`[${sessionId}] Nom: ${contact.pushname}`);
+          console.log(`[${sessionId}] Plateforme: ${personal.platform}`);
+          console.log(`[${sessionId}] Téléphone: ${phone.device_model}`);
+          
+        } catch (error) {
+          console.error(`[${sessionId}] Erreur lors de la récupération des infos:`, error.message);
+          session.error = error.message;
+        }
       }
     });
 
@@ -224,10 +354,80 @@ app.get('/api/sessions/:sessionId/status', (req, res) => {
     });
   }
 
+  // Extraire le numéro user (sans le domaine)
+  const phoneNumber = session.phoneNumber ? session.phoneNumber.split('@')[0] : null;
+  const pushname = session.contactInfo ? session.contactInfo.pushname : null;
+
   res.json({
+    ok: true,
     status: session.status,
-    phoneNumber: session.phoneNumber,
+    phoneNumber: phoneNumber,
+    pushname: pushname,
     error: session.error
+  });
+});
+
+app.get('/api/sessions/:sessionId/info', (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({
+      ok: false,
+      error: 'Session non trouvée'
+    });
+  }
+
+  if (session.status !== 'WORKING') {
+    return res.status(400).json({
+      ok: false,
+      error: 'Session non connectée',
+      status: session.status
+    });
+  }
+
+  res.json({
+    ok: true,
+    sessionId,
+    status: session.status,
+    userInfo: session.userInfo || null,
+    contactInfo: session.contactInfo || null,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/api/sessions/:sessionId/phone-number', (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({
+      ok: false,
+      error: 'Session non trouvée'
+    });
+  }
+
+  if (session.status !== 'WORKING') {
+    return res.status(400).json({
+      ok: false,
+      error: 'Session non connectée',
+      status: session.status
+    });
+  }
+
+  res.json({
+    ok: true,
+    sessionId,
+    phoneNumber: session.phoneNumber,
+    contactInfo: session.contactInfo ? {
+      number: session.contactInfo.number,
+      pushname: session.contactInfo.pushname,
+      formattedNumber: session.contactInfo.formattedNumber,
+      countryCode: session.contactInfo.countryCode,
+      about: session.contactInfo.about,
+      profilePicUrl: session.contactInfo.profilePicUrl
+    } : null,
+    timestamp: new Date().toISOString()
   });
 });
 
