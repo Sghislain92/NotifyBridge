@@ -54,7 +54,7 @@ const puppeteerConfig = {
     '--enable-features=NetworkService,NetworkServiceInProcess',
     '--disable-blink-features=AutomationControlled'
   ],
-  protocolTimeout: 300000, // 300 secondes au lieu de 180
+  protocolTimeout: 300000,
   timeout: 60000,
   executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
 };
@@ -77,22 +77,17 @@ async function createClient(sessionId) {
       }
     });
 
-    // ============================================
-    // ÉVÉNEMENTS CLIENT
-    // ============================================
-
     client.on('qr', async (qr) => {
       console.log(`[${sessionId}] QR Code généré - En attente de scan...`);
       const session = sessions.get(sessionId);
       if (session) {
         session.status = 'SCAN_QR';
-        // Convertir le QR en format data:image/png;base64
         try {
           const qrImage = await qrcode.toDataURL(qr);
           session.qr = qrImage;
         } catch (e) {
           console.error(`[${sessionId}] Erreur conversion QR:`, e.message);
-          session.qr = qr; // Fallback
+          session.qr = qr;
         }
         session.lastActivity = Date.now();
       }
@@ -125,10 +120,6 @@ async function createClient(sessionId) {
         session.lastActivity = Date.now();
         
         try {
-          // ============================================
-          // RÉCUPÉRER TOUTES LES INFORMATIONS
-          // ============================================
-          
           // 1. Informations de base (synchrones)
           const wid = {
             serialized: client.info.wid._serialized,
@@ -160,7 +151,7 @@ async function createClient(sessionId) {
               plugged: batteryStatus.plugged
             };
           } catch (e) {
-            console.log(`[${sessionId}] Batterie non disponible (normal sur Web/Windows)`);
+            console.log(`[${sessionId}] Batterie non disponible`);
           }
           
           // 5. Récupérer le contact de l'utilisateur connecté
@@ -191,36 +182,26 @@ async function createClient(sessionId) {
           
           try {
             countryCode = await contact.getCountryCode();
-          } catch (e) {
-            console.log(`[${sessionId}] Code pays non disponible`);
-          }
+          } catch (e) {}
           
           try {
             formattedNumber = await contact.getFormattedNumber();
-          } catch (e) {
-            console.log(`[${sessionId}] Numéro formaté non disponible`);
-          }
+          } catch (e) {}
           
           try {
             profilePicUrl = await contact.getProfilePicUrl();
-          } catch (e) {
-            console.log(`[${sessionId}] Photo de profil non disponible`);
-          }
+          } catch (e) {}
           
           try {
             about = await contact.getAbout();
-          } catch (e) {
-            console.log(`[${sessionId}] Statut non disponible`);
-          }
+          } catch (e) {}
           
           try {
             commonGroups = await contact.getCommonGroups();
-          } catch (e) {
-            console.log(`[${sessionId}] Groupes en commun non disponibles`);
-          }
+          } catch (e) {}
           
-          // 7. Stocker toutes les informations dans la session
-          session.phoneNumber = wid.serialized;
+          // 7. Stocker toutes les informations
+          session.phoneNumber = wid.user; // Stocker uniquement le numéro (sans @c.us)
           session.userInfo = {
             wid,
             personal,
@@ -237,14 +218,10 @@ async function createClient(sessionId) {
             commonGroupsCount: commonGroups ? commonGroups.length : 0
           };
           
-          console.log(`[${sessionId}] ✅ Toutes les informations récupérées`);
-          console.log(`[${sessionId}] Numéro: ${wid.user}`);
-          console.log(`[${sessionId}] Nom: ${contact.pushname}`);
-          console.log(`[${sessionId}] Plateforme: ${personal.platform}`);
-          console.log(`[${sessionId}] Téléphone: ${phone.device_model}`);
+          console.log(`[${sessionId}] ✅ Informations récupérées - Numéro: ${wid.user} - Nom: ${contact.pushname}`);
           
         } catch (error) {
-          console.error(`[${sessionId}] Erreur lors de la récupération des infos:`, error.message);
+          console.error(`[${sessionId}] Erreur récupération infos:`, error.message);
           session.error = error.message;
         }
       }
@@ -282,7 +259,7 @@ async function createClient(sessionId) {
 
     return client;
   } catch (error) {
-    console.error(`[${sessionId}] Erreur lors de la création du client:`, error.message);
+    console.error(`[${sessionId}] Erreur création client:`, error.message);
     throw error;
   }
 }
@@ -296,10 +273,13 @@ app.post('/api/sessions/:sessionId/start', async (req, res) => {
 
   try {
     if (sessions.has(sessionId)) {
+      const session = sessions.get(sessionId);
       return res.json({
         ok: true,
         message: 'Session déjà en cours',
-        sessionId
+        sessionId,
+        phoneNumber: session.phoneNumber || null,
+        pushname: session.contactInfo?.pushname || null
       });
     }
 
@@ -313,7 +293,9 @@ app.post('/api/sessions/:sessionId/start', async (req, res) => {
       createdAt: new Date().toISOString(),
       lastActivity: Date.now(),
       messagesCount: 0,
-      error: null
+      error: null,
+      userInfo: null,
+      contactInfo: null
     });
 
     await client.initialize();
@@ -321,7 +303,9 @@ app.post('/api/sessions/:sessionId/start', async (req, res) => {
     res.json({
       ok: true,
       message: 'Initialisation de la session WhatsApp lancée en mode Stealth',
-      sessionId
+      sessionId,
+      phoneNumber: null,
+      pushname: null
     });
   } catch (error) {
     console.error(`[${sessionId}] Erreur:`, error.message);
@@ -367,19 +351,16 @@ app.get('/api/sessions/:sessionId/status', (req, res) => {
     });
   }
 
-  // Extraire le numéro user (sans le domaine)
-  const phoneNumber = session.phoneNumber ? session.phoneNumber.split('@')[0] : null;
-  const pushname = session.contactInfo ? session.contactInfo.pushname : null;
-
   res.json({
     ok: true,
     status: session.status,
-    phoneNumber: phoneNumber,
-    pushname: pushname,
+    phoneNumber: session.phoneNumber || null,
+    pushname: session.contactInfo?.pushname || null,
     error: session.error
   });
 });
 
+// NOUVEAU: Endpoint info complet
 app.get('/api/sessions/:sessionId/info', (req, res) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
@@ -409,6 +390,7 @@ app.get('/api/sessions/:sessionId/info', (req, res) => {
   });
 });
 
+// NOUVEAU: Endpoint simplifié phone-number
 app.get('/api/sessions/:sessionId/phone-number', (req, res) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
@@ -465,7 +447,7 @@ app.delete('/api/sessions/:sessionId', async (req, res) => {
       message: 'Session détruite'
     });
   } catch (error) {
-    console.error(`[${sessionId}] Erreur lors de la suppression:`, error.message);
+    console.error(`[${sessionId}] Erreur suppression:`, error.message);
     sessions.delete(sessionId);
     res.json({
       ok: true,
@@ -475,7 +457,7 @@ app.delete('/api/sessions/:sessionId', async (req, res) => {
 });
 
 // ============================================
-// ENDPOINTS MESSAGES
+// ENDPOINTS MESSAGES - VERSION AMÉLIORÉE
 // ============================================
 
 app.post('/api/messages/send', async (req, res) => {
@@ -518,6 +500,8 @@ app.post('/api/messages/send', async (req, res) => {
     }
 
     const messageId = sentMessage.id.id;
+    
+    // Stocker le message avec infos de l'expéditeur
     messageTracking.set(messageId, {
       messageId,
       sessionId,
@@ -527,7 +511,9 @@ app.post('/api/messages/send', async (req, res) => {
       ack: 1,
       timestamp: new Date().toISOString(),
       lastUpdate: new Date().toISOString(),
-      hasMedia: !!(image || video || audio || file)
+      hasMedia: !!(image || video || audio || file),
+      fromNumber: session.phoneNumber,
+      fromPushname: session.contactInfo?.pushname
     });
 
     session.messagesCount++;
@@ -536,12 +522,17 @@ app.post('/api/messages/send', async (req, res) => {
       await sentMessage.react(reactions);
     }
 
+    // Réponse enrichie avec les infos de l'expéditeur
     res.json({
       ok: true,
       message: 'Message envoyé',
       messageId,
       sessionId,
       to,
+      from: {
+        number: session.phoneNumber,
+        pushname: session.contactInfo?.pushname || null
+      },
       status: 'sent',
       hasMedia: !!(image || video || audio || file),
       timestamp: new Date().toISOString()
@@ -602,7 +593,9 @@ app.post('/api/messages/batch', async (req, res) => {
           ack: 1,
           timestamp: new Date().toISOString(),
           lastUpdate: new Date().toISOString(),
-          hasMedia: !!(image || video || audio || file)
+          hasMedia: !!(image || video || audio || file),
+          fromNumber: session.phoneNumber,
+          fromPushname: session.contactInfo?.pushname
         });
 
         results.push({
@@ -626,6 +619,10 @@ app.post('/api/messages/batch', async (req, res) => {
       ok: true,
       message: `Messages envoyés: ${results.filter(r => r.status === 'sent').length}/${recipients.length}`,
       sessionId,
+      from: {
+        number: session.phoneNumber,
+        pushname: session.contactInfo?.pushname || null
+      },
       results,
       timestamp: new Date().toISOString()
     });
@@ -658,6 +655,10 @@ app.get('/api/messages/:messageId/status', (req, res) => {
     messageId,
     sessionId: msg.sessionId,
     to: msg.to,
+    from: {
+      number: msg.fromNumber,
+      pushname: msg.fromPushname
+    },
     status: msg.status,
     ack: msg.ack,
     timestamp: msg.timestamp,
@@ -673,6 +674,10 @@ app.get('/api/sessions/:sessionId/messages', (req, res) => {
   res.json({
     ok: true,
     sessionId,
+    from: {
+      number: sessions.get(sessionId)?.phoneNumber || null,
+      pushname: sessions.get(sessionId)?.contactInfo?.pushname || null
+    },
     count: messages.length,
     messages
   });
@@ -686,6 +691,10 @@ app.get('/api/sessions/:sessionId/messages/status/:status', (req, res) => {
   res.json({
     ok: true,
     sessionId,
+    from: {
+      number: sessions.get(sessionId)?.phoneNumber || null,
+      pushname: sessions.get(sessionId)?.contactInfo?.pushname || null
+    },
     filter: status,
     count: messages.length,
     messages
@@ -728,6 +737,7 @@ app.get('/api/stats', (req, res) => {
       sessionId,
       status: session.status,
       phoneNumber: session.phoneNumber,
+      pushname: session.contactInfo?.pushname,
       messagesCount: session.messagesCount
     });
   });
@@ -748,6 +758,8 @@ app.listen(PORT, () => {
   console.log(`📍 Endpoint de démarrage : POST http://localhost:${PORT}/api/sessions/VOTRE_ID/start`);
   console.log(`📍 Récupérer QR : GET http://localhost:${PORT}/api/sessions/VOTRE_ID/qr`);
   console.log(`📍 Vérifier statut : GET http://localhost:${PORT}/api/sessions/VOTRE_ID/status`);
+  console.log(`📍 Infos complètes : GET http://localhost:${PORT}/api/sessions/VOTRE_ID/info`);
+  console.log(`📍 Numéro simplifié : GET http://localhost:${PORT}/api/sessions/VOTRE_ID/phone-number`);
   console.log(`📍 Envoyer message : POST http://localhost:${PORT}/api/messages/send`);
   console.log(`📍 Suivi message : GET http://localhost:${PORT}/api/messages/MESSAGE_ID/status`);
   console.log(`\n`);
