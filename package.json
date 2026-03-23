@@ -1,7 +1,7 @@
 {
   "name": "notify-bridge",
-  "version": "4.0.0",
-  "description": "WhatsApp API Bridge with Multi-Tenant Support, Stealth Mode, and Database Persistence",
+  "version": "2.0.5",
+  "description": "WhatsApp API Bridge with Stealth Mode, Message Sending, and Status Polling",
   "main": "api-legacy.js",
   "scripts": {
     "start": "node api-legacy.js",
@@ -14,14 +14,9 @@
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "cors": "^2.8.5",
-    "jsonwebtoken": "^9.0.2",
-    "axios": "^1.6.5",
-    "mysql2": "^3.6.5"
+    "axios": "^1.6.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
