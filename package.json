@@ -1,11 +1,11 @@
 {
   "name": "notify-bridge",
-  "version": "2.0.5",
+  "version": "2.1.1",
   "description": "WhatsApp API Bridge with Stealth Mode, Message Sending, and Status Polling",
-  "main": "api-legacy.js",
+  "main": "api-legacy-v3.js",
   "scripts": {
-    "start": "node api-legacy.js",
-    "dev": "nodemon api-legacy.js"
+    "start": "node api-legacy-v3.js",
+    "dev": "nodemon api-legacy-v3.js"
   },
   "dependencies": {
     "express": "^4.18.2",
