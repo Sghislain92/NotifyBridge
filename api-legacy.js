@@ -4,8 +4,6 @@ const qrcode = require('qrcode');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const cors = require('cors');
-const jwt = require('jsonwebtoken');
-const mysql = require('mysql2/promise');
 const axios = require('axios');
 
 /**
@@ -19,166 +17,19 @@ app.use(express.urlencoded({ limit: '50mb' }));
 app.use(cors());
 
 // ============================================
-// CONFIGURATION
+// STOCKAGE EN MÉMOIRE (Sessions + Messages)
 // ============================================
-const API_KEY = "BWxD1xkzuPxJ0luWnsaECtn3CVZkYG6dtNUxnwUsBWWwYwvkKYl1ZZWnDuP6M";
-const JWT_SECRET = process.env.JWT_SECRET || "your-super-secret-jwt-key-change-in-production";
-const JWT_EXPIRY = "24h";
 
-// Configuration de la base de données
-const dbConfig = {
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'c1286229c_wazana_paiements',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-};
-
-// Pool de connexions MySQL
-const pool = mysql.createPool(dbConfig);
-
-// Stockage des sessions actives en mémoire (avec récupération depuis la BD au démarrage)
+// Stockage des sessions actives
 const sessions = {};
-const sessionTokens = {};
+
+// Stockage des messages avec leurs statuts
+// Structure: { messageId: { to, text, status, timestamp, ack } }
+const messageTracking = {};
 
 // ============================================
 // UTILITAIRES
 // ============================================
-
-/**
- * Génère un JWT Token pour une session
- */
-function generateSessionToken(appId, userId = "default") {
-    return jwt.sign(
-        { appId, userId, iat: Date.now() },
-        JWT_SECRET,
-        { expiresIn: JWT_EXPIRY }
-    );
-}
-
-/**
- * Vérifie le JWT Token
- */
-function verifyToken(token) {
-    try {
-        return jwt.verify(token, JWT_SECRET);
-    } catch (err) {
-        return null;
-    }
-}
-
-/**
- * Récupère une connexion à la base de données
- */
-async function getDbConnection() {
-    return await pool.getConnection();
-}
-
-/**
- * Enregistre une action dans les logs de connexion
- */
-async function logConnectionAction(appId, action, oldStatus, newStatus, details, ipAddress) {
-    try {
-        const connection = await getDbConnection();
-        await connection.execute(
-            'INSERT INTO whatsapp_connection_logs (app_id, action, old_status, new_status, details, ip_address) VALUES (?, ?, ?, ?, ?, ?)',
-            [appId, action, oldStatus, newStatus, details, ipAddress]
-        );
-        connection.release();
-    } catch (err) {
-        console.error('Erreur enregistrement log:', err);
-    }
-}
-
-/**
- * Met à jour le statut d'une application WhatsApp
- */
-async function updateAppStatus(appId, status, phoneNumber = null, qrCode = null) {
-    try {
-        const connection = await getDbConnection();
-        const updates = [];
-        const values = [];
-
-        updates.push('status = ?');
-        values.push(status);
-
-        if (phoneNumber) {
-            updates.push('phone_number = ?');
-            values.push(phoneNumber);
-        }
-
-        if (qrCode) {
-            updates.push('qr_code = ?');
-            values.push(qrCode);
-            updates.push('last_qr_generated = NOW()');
-        }
-
-        if (status === 'connected') {
-            updates.push('connected_at = NOW()');
-        } else if (status === 'disconnected') {
-            updates.push('disconnected_at = NOW()');
-        }
-
-        values.push(appId);
-
-        await connection.execute(
-            `UPDATE whatsapp_apps SET ${updates.join(', ')} WHERE id = ?`,
-            values
-        );
-        connection.release();
-    } catch (err) {
-        console.error('Erreur mise à jour statut:', err);
-    }
-}
-
-/**
- * Enregistre un message dans la base de données
- */
-async function saveMessage(appId, recipientNumber, message, status, apiResponse = null) {
-    try {
-        const connection = await getDbConnection();
-        await connection.execute(
-            'INSERT INTO whatsapp_messages (app_id, recipient_number, message, status, api_response) VALUES (?, ?, ?, ?, ?)',
-            [appId, recipientNumber, message, status, apiResponse]
-        );
-        connection.release();
-    } catch (err) {
-        console.error('Erreur enregistrement message:', err);
-    }
-}
-
-/**
- * Enregistre les statistiques d'envoi
- */
-async function updateStats(appId, messagesSent = 0, messagesFailed = 0) {
-    try {
-        const connection = await getDbConnection();
-        const today = new Date().toISOString().split('T')[0];
-
-        // Vérifier si une entrée existe pour aujourd'hui
-        const [rows] = await connection.execute(
-            'SELECT id FROM whatsapp_stats WHERE app_id = ? AND date = ?',
-            [appId, today]
-        );
-
-        if (rows.length > 0) {
-            await connection.execute(
-                'UPDATE whatsapp_stats SET messages_sent = messages_sent + ?, messages_failed = messages_failed + ? WHERE app_id = ? AND date = ?',
-                [messagesSent, messagesFailed, appId, today]
-            );
-        } else {
-            await connection.execute(
-                'INSERT INTO whatsapp_stats (app_id, date, messages_sent, messages_failed) VALUES (?, ?, ?, ?)',
-                [appId, today, messagesSent, messagesFailed]
-            );
-        }
-        connection.release();
-    } catch (err) {
-        console.error('Erreur mise à jour stats:', err);
-    }
-}
 
 /**
  * Télécharge un fichier depuis une URL
@@ -231,88 +82,71 @@ function getMimeType(url) {
     return mimeTypes[ext] || 'application/octet-stream';
 }
 
-// ============================================
-// MIDDLEWARE D'AUTHENTIFICATION
-// ============================================
-
-function verifyMasterApiKey(req, res, next) {
-    const apiKey = req.headers["x-api-key"];
-    if (apiKey !== API_KEY) {
-        return res.status(401).json({ error: "API Key invalide ou manquante" });
-    }
-    next();
-}
-
-function verifyJWTToken(req, res, next) {
-    const token = req.headers["authorization"]?.replace("Bearer ", "");
-    if (!token) {
-        return res.status(401).json({ error: "Token manquant" });
-    }
-
-    const decoded = verifyToken(token);
-    if (!decoded) {
-        return res.status(401).json({ error: "Token invalide ou expiré" });
-    }
-
-    req.appId = decoded.appId;
-    req.userId = decoded.userId;
-    next();
+/**
+ * Convertit les codes ACK WhatsApp en statuts lisibles
+ */
+function getMessageStatus(ack) {
+    const statusMap = {
+        0: 'pending',
+        1: 'sent',
+        2: 'delivered',
+        3: 'read',
+        4: 'played'
+    };
+    return statusMap[ack] || 'unknown';
 }
 
 // ============================================
-// ENDPOINTS DE GESTION DES SESSIONS
+// ENDPOINTS
 // ============================================
 
 /**
  * GET /api/health
+ * Vérifier que l'API fonctionne
  */
 app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", timestamp: new Date().toISOString() });
+    res.json({
+        status: "ok",
+        timestamp: new Date().toISOString(),
+        activeSessions: Object.keys(sessions).length,
+        trackedMessages: Object.keys(messageTracking).length
+    });
 });
 
 /**
- * POST /api/sessions/:appId/start
+ * POST /api/sessions/:sessionId/start
  * Démarre une nouvelle session WhatsApp
  */
-app.post("/api/sessions/:appId/start", verifyMasterApiKey, async (req, res) => {
+app.post("/api/sessions/:sessionId/start", async (req, res) => {
     try {
-        const appId = parseInt(req.params.appId);
-        const userId = req.body.userId || "default";
+        const sessionId = req.params.sessionId;
 
-        // Récupérer l'app depuis la BD
-        const connection = await getDbConnection();
-        const [apps] = await connection.execute(
-            'SELECT * FROM whatsapp_apps WHERE id = ?',
-            [appId]
-        );
-        connection.release();
-
-        if (apps.length === 0) {
-            return res.status(404).json({ error: "Application non trouvée" });
-        }
-
-        const app = apps[0];
+        console.log(`[Session ${sessionId}] Démarrage...`);
 
         // Nettoyage si une session existe déjà
-        if (sessions[appId] && sessions[appId].client) {
-            console.log(`[App ${appId}] Fermeture de l'ancienne instance...`);
+        if (sessions[sessionId] && sessions[sessionId].client) {
+            console.log(`[Session ${sessionId}] Fermeture de l'ancienne instance...`);
             try {
-                await sessions[appId].client.destroy();
+                await sessions[sessionId].client.destroy();
             } catch (e) {
-                console.error(`[App ${appId}] Erreur destruction:`, e.message);
+                console.error(`[Session ${sessionId}] Erreur destruction:`, e.message);
             }
         }
 
-        sessions[appId] = { client: null, status: "STARTING", qr: null, phoneNumber: null };
+        // Initialisation de la session
+        sessions[sessionId] = {
+            client: null,
+            status: "STARTING",
+            qr: null,
+            phoneNumber: null,
+            createdAt: new Date(),
+            messages: {}
+        };
 
-        // Génération du JWT Token
-        const token = generateSessionToken(appId, userId);
-        sessionTokens[appId] = token;
-
-        // Initialisation du client
+        // Création du client WhatsApp
         const client = new Client({
             authStrategy: new LocalAuth({
-                clientId: `app-${appId}`,
+                clientId: `session-${sessionId}`,
                 dataPath: './.wwebjs_auth'
             }),
             webVersionCache: {
@@ -340,155 +174,186 @@ app.post("/api/sessions/:appId/start", verifyMasterApiKey, async (req, res) => {
             }
         });
 
-        // Gestion des événements
+        // Événement: QR Code généré
         client.on('qr', async (qr) => {
             try {
                 const qrCodeBase64 = await qrcode.toDataURL(qr);
-                sessions[appId].qr = qrCodeBase64;
-                sessions[appId].status = "SCAN_QR";
-                
-                // Mise à jour BD
-                await updateAppStatus(appId, 'qr', null, qrCodeBase64);
-                await logConnectionAction(appId, 'qr_generated', 'STARTING', 'SCAN_QR', 'QR code généré', req.ip);
-                
-                console.log(`[App ${appId}] QR Code généré`);
+                sessions[sessionId].qr = qrCodeBase64;
+                sessions[sessionId].status = "SCAN_QR";
+                console.log(`[Session ${sessionId}] QR Code généré`);
             } catch (err) {
-                console.error(`[App ${appId}] Erreur QR:`, err);
+                console.error(`[Session ${sessionId}] Erreur QR:`, err);
             }
         });
 
+        // Événement: Client prêt
         client.on('ready', async () => {
             try {
-                // Récupérer le numéro WhatsApp
                 const phoneNumber = client.info.wid.user;
-                sessions[appId].status = "WORKING";
-                sessions[appId].qr = null;
-                sessions[appId].phoneNumber = phoneNumber;
-
-                // Mise à jour BD
-                await updateAppStatus(appId, 'connected', phoneNumber);
-                await logConnectionAction(appId, 'connect', 'SCAN_QR', 'WORKING', `Connecté avec ${phoneNumber}`, req.ip);
-                
-                console.log(`[App ${appId}] ✅ Session opérationnelle! Numéro: ${phoneNumber}`);
+                sessions[sessionId].status = "WORKING";
+                sessions[sessionId].qr = null;
+                sessions[sessionId].phoneNumber = phoneNumber;
+                console.log(`[Session ${sessionId}] ✅ Session opérationnelle! Numéro: ${phoneNumber}`);
             } catch (err) {
-                console.error(`[App ${appId}] Erreur ready:`, err);
+                console.error(`[Session ${sessionId}] Erreur ready:`, err);
             }
         });
 
+        // Événement: Authentification réussie
         client.on('authenticated', async () => {
-            try {
-                await logConnectionAction(appId, 'authenticated', null, 'AUTHENTICATED', 'Authentification réussie', req.ip);
-                console.log(`[App ${appId}] 🔓 Authentification réussie`);
-            } catch (err) {
-                console.error(`[App ${appId}] Erreur authenticated:`, err);
-            }
+            console.log(`[Session ${sessionId}] 🔓 Authentification réussie`);
         });
 
+        // Événement: Échec d'authentification
         client.on('auth_failure', async (msg) => {
             try {
-                sessions[appId].status = "AUTH_FAILURE";
-                await updateAppStatus(appId, 'disconnected');
-                await logConnectionAction(appId, 'auth_failure', 'AUTHENTICATED', 'AUTH_FAILURE', msg, req.ip);
-                console.error(`[App ${appId}] ❌ Échec auth:`, msg);
+                sessions[sessionId].status = "AUTH_FAILURE";
+                console.error(`[Session ${sessionId}] ❌ Échec auth:`, msg);
             } catch (err) {
-                console.error(`[App ${appId}] Erreur auth_failure:`, err);
+                console.error(`[Session ${sessionId}] Erreur auth_failure:`, err);
             }
         });
 
+        // Événement: Déconnexion
         client.on('disconnected', async (reason) => {
             try {
-                sessions[appId].status = "DISCONNECTED";
-                await updateAppStatus(appId, 'disconnected');
-                await logConnectionAction(appId, 'disconnect', 'WORKING', 'DISCONNECTED', reason, req.ip);
-                console.log(`[App ${appId}] 🔌 Déconnecté:`, reason);
+                sessions[sessionId].status = "DISCONNECTED";
+                console.log(`[Session ${sessionId}] 🔌 Déconnecté:`, reason);
             } catch (err) {
-                console.error(`[App ${appId}] Erreur disconnected:`, err);
+                console.error(`[Session ${sessionId}] Erreur disconnected:`, err);
             }
         });
 
-        sessions[appId].client = client;
+        // Événement: Changement de statut de message (ACK)
+        client.on('message_ack', (msg, ack) => {
+            try {
+                const messageId = msg.id.id;
+                const status = getMessageStatus(ack);
+                
+                // Enregistrer le changement de statut
+                if (messageTracking[messageId]) {
+                    messageTracking[messageId].status = status;
+                    messageTracking[messageId].ack = ack;
+                    messageTracking[messageId].lastUpdate = new Date();
+                }
+
+                // Aussi enregistrer dans la session
+                if (sessions[sessionId] && sessions[sessionId].messages[messageId]) {
+                    sessions[sessionId].messages[messageId].status = status;
+                    sessions[sessionId].messages[messageId].ack = ack;
+                }
+
+                console.log(`[Session ${sessionId}] Message ${messageId}: ${status}`);
+            } catch (err) {
+                console.error(`[Session ${sessionId}] Erreur message_ack:`, err);
+            }
+        });
+
+        // Initialisation du client
+        sessions[sessionId].client = client;
         client.initialize().catch(err => {
-            console.error(`[App ${appId}] Erreur init:`, err);
-            sessions[appId].status = "ERROR";
+            console.error(`[Session ${sessionId}] Erreur init:`, err);
+            sessions[sessionId].status = "ERROR";
         });
 
         res.json({
             ok: true,
             message: "Session initialisée",
-            appId: appId,
-            token: token,
-            expiresIn: JWT_EXPIRY
+            sessionId: sessionId,
+            status: "STARTING"
         });
     } catch (err) {
         console.error('Erreur démarrage session:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ ok: false, error: err.message });
     }
 });
 
 /**
- * GET /api/sessions/:appId/qr
+ * GET /api/sessions/:sessionId/qr
+ * Récupère le QR code
  */
-app.get("/api/sessions/:appId/qr", verifyMasterApiKey, (req, res) => {
-    const appId = parseInt(req.params.appId);
-    const session = sessions[appId];
+app.get("/api/sessions/:sessionId/qr", (req, res) => {
+    const sessionId = req.params.sessionId;
+    const session = sessions[sessionId];
     
-    if (!session) return res.status(404).json({ error: "Session non trouvée" });
+    if (!session) {
+        return res.status(404).json({ ok: false, error: "Session non trouvée" });
+    }
 
     if (session.status === "WORKING") {
-        return res.json({ 
-            status: "WORKING", 
+        return res.json({
+            ok: true,
+            status: "WORKING",
             message: "Déjà connecté",
-            phoneNumber: session.phoneNumber 
+            phoneNumber: session.phoneNumber
         });
     }
 
     if (!session.qr) {
-        return res.json({ status: session.status, message: "QR non disponible" });
+        return res.json({
+            ok: true,
+            status: session.status,
+            message: "QR non disponible",
+            qr: null
+        });
     }
 
-    res.json({ qr: session.qr, status: session.status });
-});
-
-/**
- * GET /api/sessions/:appId/status
- */
-app.get("/api/sessions/:appId/status", verifyMasterApiKey, (req, res) => {
-    const appId = parseInt(req.params.appId);
-    const session = sessions[appId];
-    
-    if (!session) return res.status(404).json({ error: "Session non trouvée" });
-    
-    res.json({ 
+    res.json({
+        ok: true,
         status: session.status,
-        phoneNumber: session.phoneNumber
+        qr: session.qr
     });
 });
 
 /**
- * DELETE /api/sessions/:appId
+ * GET /api/sessions/:sessionId/status
+ * Récupère le statut de la session
  */
-app.delete("/api/sessions/:appId", verifyMasterApiKey, async (req, res) => {
+app.get("/api/sessions/:sessionId/status", (req, res) => {
+    const sessionId = req.params.sessionId;
+    const session = sessions[sessionId];
+    
+    if (!session) {
+        return res.status(404).json({ ok: false, error: "Session non trouvée" });
+    }
+    
+    res.json({
+        ok: true,
+        sessionId: sessionId,
+        status: session.status,
+        phoneNumber: session.phoneNumber,
+        createdAt: session.createdAt,
+        messagesTracked: Object.keys(session.messages).length
+    });
+});
+
+/**
+ * DELETE /api/sessions/:sessionId
+ * Déconnecte et supprime la session
+ */
+app.delete("/api/sessions/:sessionId", async (req, res) => {
     try {
-        const appId = parseInt(req.params.appId);
-        const session = sessions[appId];
+        const sessionId = req.params.sessionId;
+        const session = sessions[sessionId];
         
-        if (!session) return res.status(404).json({ error: "Session non trouvée" });
+        if (!session) {
+            return res.status(404).json({ ok: false, error: "Session non trouvée" });
+        }
 
         if (session.client) {
             await session.client.destroy();
         }
 
-        // Mise à jour BD
-        await updateAppStatus(appId, 'disconnected');
-        await logConnectionAction(appId, 'disconnect', session.status, 'DISCONNECTED', 'Déconnexion manuelle', req.ip);
+        delete sessions[sessionId];
 
-        delete sessions[appId];
-        delete sessionTokens[appId];
-
-        res.json({ ok: true, message: "Session détruite" });
+        res.json({
+            ok: true,
+            message: "Session détruite",
+            sessionId: sessionId
+        });
     } catch (err) {
         console.error('Erreur suppression session:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ ok: false, error: err.message });
     }
 });
 
@@ -498,35 +363,25 @@ app.delete("/api/sessions/:appId", verifyMasterApiKey, async (req, res) => {
 
 /**
  * POST /api/messages/send
- * Endpoint unifié pour envoyer tous types de messages
- * 
- * Body:
- * {
- *   "to": "33612345678" ou "120363123456789-1234567890@g.us",
- *   "text": "Bonjour!", (OBLIGATOIRE)
- *   "image": "https://example.com/image.jpg" (optionnel),
- *   "video": "https://example.com/video.mp4" (optionnel),
- *   "audio": "https://example.com/audio.mp3" (optionnel),
- *   "file": "https://example.com/document.pdf" (optionnel),
- *   "fileName": "document.pdf" (requis si file),
- *   "mentions": ["33612345678"] (optionnel),
- *   "buttons": [...] (optionnel, future feature),
- *   "reactions": "👍" (optionnel)
- * }
+ * Envoie un message (texte, image, vidéo, audio, fichier)
  */
-app.post("/api/messages/send", verifyJWTToken, async (req, res) => {
+app.post("/api/messages/send", async (req, res) => {
     try {
-        const appId = req.appId;
-        const { to, text, image, video, audio, file, fileName, mentions, buttons, reactions } = req.body;
+        const { sessionId, to, text, image, video, audio, file, fileName, mentions, reactions } = req.body;
 
-        // Validation
-        if (!to || !text) {
-            return res.status(400).json({ error: "Paramètres obligatoires manquants: to, text" });
+        if (!sessionId || !to || !text) {
+            return res.status(400).json({
+                ok: false,
+                error: "Paramètres obligatoires manquants: sessionId, to, text"
+            });
         }
 
-        const session = sessions[appId];
+        const session = sessions[sessionId];
         if (!session || !session.client || session.status !== "WORKING") {
-            return res.status(400).json({ error: "Session non connectée" });
+            return res.status(400).json({
+                ok: false,
+                error: "Session non connectée ou non trouvée"
+            });
         }
 
         const client = session.client;
@@ -534,7 +389,7 @@ app.post("/api/messages/send", verifyJWTToken, async (req, res) => {
         let mediaToSend = null;
 
         // Gestion des mentions
-        if (mentions && mentions.length > 0) {
+        if (mentions && Array.isArray(mentions) && mentions.length > 0) {
             messageOptions.mentions = mentions;
         }
 
@@ -552,7 +407,10 @@ app.post("/api/messages/send", verifyJWTToken, async (req, res) => {
             mediaToSend = media;
         } else if (file) {
             if (!fileName) {
-                return res.status(400).json({ error: "fileName requis pour les fichiers" });
+                return res.status(400).json({
+                    ok: false,
+                    error: "fileName requis pour les fichiers"
+                });
             }
             const mimeType = getMimeType(file);
             const media = await createMessageMedia(file, mimeType);
@@ -564,14 +422,28 @@ app.post("/api/messages/send", verifyJWTToken, async (req, res) => {
         const messageContent = mediaToSend || text;
         const result = await client.sendMessage(to, messageContent, messageOptions);
 
-        // Enregistrement en BD
-        await saveMessage(appId, to, text, 'sent', JSON.stringify(result));
-        await updateStats(appId, 1, 0);
+        const messageId = result.id.id;
 
-        // Gestion des réactions (si spécifié)
+        // Enregistrement du message pour le suivi
+        messageTracking[messageId] = {
+            sessionId: sessionId,
+            to: to,
+            text: text,
+            status: 'sent',
+            ack: 1,
+            timestamp: new Date(),
+            lastUpdate: new Date(),
+            hasMedia: !!mediaToSend
+        };
+
+        // Aussi enregistrer dans la session
+        if (!session.messages) session.messages = {};
+        session.messages[messageId] = messageTracking[messageId];
+
+        // Gestion des réactions
         if (reactions) {
             try {
-                await client.react(result.id.id, reactions);
+                await client.react(messageId, reactions);
             } catch (err) {
                 console.warn(`Erreur ajout réaction: ${err.message}`);
             }
@@ -580,42 +452,40 @@ app.post("/api/messages/send", verifyJWTToken, async (req, res) => {
         res.json({
             ok: true,
             message: "Message envoyé",
-            messageId: result.id.id,
+            messageId: messageId,
+            sessionId: sessionId,
             to: to,
+            status: "sent",
             hasMedia: !!mediaToSend,
             timestamp: new Date().toISOString()
         });
     } catch (err) {
         console.error("Erreur envoi message:", err);
-        
-        // Enregistrement de l'erreur en BD
-        try {
-            await saveMessage(req.appId, req.body.to, req.body.text, 'failed', err.message);
-            await updateStats(req.appId, 0, 1);
-        } catch (dbErr) {
-            console.error('Erreur enregistrement erreur:', dbErr);
-        }
-
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ ok: false, error: err.message });
     }
 });
 
 /**
  * POST /api/messages/batch
- * Envoyer à plusieurs destinataires
+ * Envoie le même message à plusieurs destinataires
  */
-app.post("/api/messages/batch", verifyJWTToken, async (req, res) => {
+app.post("/api/messages/batch", async (req, res) => {
     try {
-        const appId = req.appId;
-        const { recipients, text, image, video, audio, file, fileName, mentions } = req.body;
+        const { sessionId, recipients, text, image, video, audio, file, fileName, mentions } = req.body;
 
-        if (!recipients || !Array.isArray(recipients) || recipients.length === 0 || !text) {
-            return res.status(400).json({ error: "Paramètres manquants: recipients (array), text" });
+        if (!sessionId || !recipients || !Array.isArray(recipients) || recipients.length === 0 || !text) {
+            return res.status(400).json({
+                ok: false,
+                error: "Paramètres manquants: sessionId, recipients (array), text"
+            });
         }
 
-        const session = sessions[appId];
+        const session = sessions[sessionId];
         if (!session || !session.client || session.status !== "WORKING") {
-            return res.status(400).json({ error: "Session non connectée" });
+            return res.status(400).json({
+                ok: false,
+                error: "Session non connectée ou non trouvée"
+            });
         }
 
         const client = session.client;
@@ -627,7 +497,7 @@ app.post("/api/messages/batch", verifyJWTToken, async (req, res) => {
                 let messageOptions = {};
                 let mediaToSend = null;
 
-                if (mentions && mentions.length > 0) {
+                if (mentions && Array.isArray(mentions) && mentions.length > 0) {
                     messageOptions.mentions = mentions;
                 }
 
@@ -652,13 +522,27 @@ app.post("/api/messages/batch", verifyJWTToken, async (req, res) => {
                 const messageContent = mediaToSend || text;
                 const result = await client.sendMessage(recipient, messageContent, messageOptions);
 
-                // Enregistrement en BD
-                await saveMessage(appId, recipient, text, 'sent', JSON.stringify(result));
+                const messageId = result.id.id;
+
+                // Enregistrement du message
+                messageTracking[messageId] = {
+                    sessionId: sessionId,
+                    to: recipient,
+                    text: text,
+                    status: 'sent',
+                    ack: 1,
+                    timestamp: new Date(),
+                    lastUpdate: new Date(),
+                    hasMedia: !!mediaToSend
+                };
+
+                if (!session.messages) session.messages = {};
+                session.messages[messageId] = messageTracking[messageId];
 
                 results.push({
                     recipient,
                     status: "sent",
-                    messageId: result.id.id
+                    messageId: messageId
                 });
             } catch (err) {
                 errors.push({
@@ -666,27 +550,116 @@ app.post("/api/messages/batch", verifyJWTToken, async (req, res) => {
                     status: "failed",
                     error: err.message
                 });
-                await saveMessage(appId, recipient, text, 'failed', err.message);
             }
 
             // Délai entre les envois
             await new Promise(resolve => setTimeout(resolve, 500));
         }
 
-        // Mise à jour des stats
-        await updateStats(appId, results.length, errors.length);
-
         res.json({
             ok: true,
             message: `Messages envoyés: ${results.length}/${recipients.length}`,
-            results,
+            sessionId: sessionId,
+            results: results,
             errors: errors.length > 0 ? errors : undefined,
             timestamp: new Date().toISOString()
         });
     } catch (err) {
         console.error("Erreur envoi batch:", err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ ok: false, error: err.message });
     }
+});
+
+// ============================================
+// ENDPOINTS DE SUIVI DES MESSAGES (POLLING)
+// ============================================
+
+/**
+ * GET /api/messages/:messageId/status
+ * Récupère le statut actuel d'un message
+ */
+app.get("/api/messages/:messageId/status", (req, res) => {
+    const messageId = req.params.messageId;
+    const message = messageTracking[messageId];
+
+    if (!message) {
+        return res.status(404).json({
+            ok: false,
+            error: "Message non trouvé"
+        });
+    }
+
+    res.json({
+        ok: true,
+        messageId: messageId,
+        sessionId: message.sessionId,
+        to: message.to,
+        status: message.status,
+        ack: message.ack,
+        timestamp: message.timestamp,
+        lastUpdate: message.lastUpdate,
+        hasMedia: message.hasMedia
+    });
+});
+
+/**
+ * GET /api/sessions/:sessionId/messages
+ * Récupère tous les messages d'une session
+ */
+app.get("/api/sessions/:sessionId/messages", (req, res) => {
+    const sessionId = req.params.sessionId;
+    const session = sessions[sessionId];
+
+    if (!session) {
+        return res.status(404).json({
+            ok: false,
+            error: "Session non trouvée"
+        });
+    }
+
+    const messages = Object.entries(session.messages || {}).map(([messageId, msg]) => ({
+        messageId,
+        ...msg
+    }));
+
+    res.json({
+        ok: true,
+        sessionId: sessionId,
+        count: messages.length,
+        messages: messages
+    });
+});
+
+/**
+ * GET /api/sessions/:sessionId/messages/status/:status
+ * Récupère les messages d'une session filtrés par statut
+ */
+app.get("/api/sessions/:sessionId/messages/status/:status", (req, res) => {
+    const sessionId = req.params.sessionId;
+    const filterStatus = req.params.status;
+    const session = sessions[sessionId];
+
+    if (!session) {
+        return res.status(404).json({
+            ok: false,
+            error: "Session non trouvée"
+        });
+    }
+
+    const messages = Object.entries(session.messages || {})
+        .filter(([, msg]) => msg.status === filterStatus)
+        .map(([messageId, msg]) => ({
+            messageId,
+            ...msg
+        }));
+
+    res.json({
+        ok: true,
+        sessionId: sessionId,
+        filter: filterStatus,
+        count: messages.length,
+        messages: messages
+    });
 });
 
 // ============================================
@@ -694,29 +667,34 @@ app.post("/api/messages/batch", verifyJWTToken, async (req, res) => {
 // ============================================
 
 /**
- * GET /api/stats/:appId
+ * GET /api/stats
+ * Récupère les statistiques globales
  */
-app.get("/api/stats/:appId", verifyMasterApiKey, async (req, res) => {
-    try {
-        const appId = parseInt(req.params.appId);
-        const connection = await getDbConnection();
+app.get("/api/stats", (req, res) => {
+    const stats = {
+        activeSessions: Object.keys(sessions).length,
+        trackedMessages: Object.keys(messageTracking).length,
+        messagesByStatus: {
+            pending: Object.values(messageTracking).filter(m => m.status === 'pending').length,
+            sent: Object.values(messageTracking).filter(m => m.status === 'sent').length,
+            delivered: Object.values(messageTracking).filter(m => m.status === 'delivered').length,
+            read: Object.values(messageTracking).filter(m => m.status === 'read').length,
+            played: Object.values(messageTracking).filter(m => m.status === 'played').length
+        },
+        sessions: Object.entries(sessions).map(([sessionId, session]) => ({
+            sessionId,
+            status: session.status,
+            phoneNumber: session.phoneNumber,
+            createdAt: session.createdAt,
+            messagesCount: Object.keys(session.messages || {}).length
+        }))
+    };
 
-        const [stats] = await connection.execute(
-            'SELECT * FROM whatsapp_stats WHERE app_id = ? ORDER BY date DESC LIMIT 30',
-            [appId]
-        );
-
-        connection.release();
-
-        res.json({
-            ok: true,
-            appId: appId,
-            stats: stats
-        });
-    } catch (err) {
-        console.error('Erreur récupération stats:', err);
-        res.status(500).json({ error: err.message });
-    }
+    res.json({
+        ok: true,
+        timestamp: new Date().toISOString(),
+        stats: stats
+    });
 });
 
 // ============================================
@@ -725,8 +703,9 @@ app.get("/api/stats/:appId", verifyMasterApiKey, async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    console.log(`\n🚀 NotifyBridge API FINAL (avec BD persistante) prête sur le port ${port}`);
+    console.log(`\n🚀 NotifyBridge API STATELESS prête sur le port ${port}`);
     console.log(`📍 Base URL: http://localhost:${port}`);
-    console.log(`🔐 Authentification: API Key + JWT Token`);
-    console.log(`💾 Base de données: ${dbConfig.database}\n`);
+    console.log(`🔓 Pas d'authentification (gérée en PHP)`);
+    console.log(`💾 Pas de BD (gérée en PHP)`);
+    console.log(`📊 Polling des statuts de messages disponible\n`);
 });
