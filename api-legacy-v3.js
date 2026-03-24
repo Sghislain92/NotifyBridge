@@ -503,12 +503,80 @@ app.get('/api/sessions', (req, res) => {
 });
 
 // ============================================
-// ENVOI DE MESSAGE TEXTE AVEC TIMEOUT AUGMENTÉ À 60s
+// ENDPOINT POUR RÉPARER UNE SESSION (RECONNEXION)
+// ============================================
+app.post('/api/sessions/:sessionId/repair', async (req, res) => {
+    const { sessionId } = req.params;
+    const session = sessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({ ok: false, error: 'Session non trouvée' });
+    }
+    
+    try {
+        console.log(`[${sessionId}] 🔧 Tentative de réparation de la session`);
+        
+        // Vérifier si le client répond
+        let state = null;
+        try {
+            state = await session.client.getState();
+            console.log(`[${sessionId}] État actuel: ${state}`);
+        } catch (e) {
+            console.log(`[${sessionId}] Impossible de récupérer l'état: ${e.message}`);
+        }
+        
+        // Si déjà connecté, pas besoin de réparer
+        if (state === 'CONNECTED') {
+            return res.json({ 
+                ok: true, 
+                status: 'already_connected', 
+                state,
+                message: 'Session déjà connectée'
+            });
+        }
+        
+        // Nettoyer l'ancien client
+        try {
+            await session.client.logout();
+            await session.client.destroy();
+        } catch (e) {
+            console.log(`[${sessionId}] Erreur lors du nettoyage: ${e.message}`);
+        }
+        
+        // Créer un nouveau client
+        console.log(`[${sessionId}] Création d'un nouveau client...`);
+        const newClient = await createClient(sessionId);
+        
+        // Mettre à jour la session
+        session.client = newClient;
+        session.status = 'STARTING';
+        session.qr = null;
+        session.error = null;
+        session.lastActivity = Date.now();
+        
+        await newClient.initialize();
+        
+        console.log(`[${sessionId}] ✅ Réparation initiée, attendez le QR code`);
+        
+        res.json({ 
+            ok: true, 
+            message: 'Session recréée, veuillez scanner le QR code',
+            status: 'repairing',
+            sessionId
+        });
+        
+    } catch (error) {
+        console.error(`[${sessionId}] ❌ Erreur réparation:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ============================================
+// ENVOI DE MESSAGE TEXTE AVEC VÉRIFICATION PRÉALABLE
 // ============================================
 
 app.post('/api/messages/send', async (req, res) => {
     console.log('=== REQUETE RECUE ===');
-    console.log('Headers:', req.headers);
     console.log('Body:', req.body);
     console.log('====================');
     const { sessionId, to, text, mentions, reactions } = req.body;
@@ -530,21 +598,57 @@ app.post('/api/messages/send', async (req, res) => {
         });
     }
 
-    if (!session.client || !session.client.info) {
-        return res.status(400).json({ ok: false, error: 'Client WhatsApp non connecté' });
+    if (!session.client) {
+        return res.status(400).json({ ok: false, error: 'Client WhatsApp non initialisé' });
     }
 
+    // === VÉRIFICATION DE L'ÉTAT RÉEL AVANT ENVOI ===
+    let isActuallyConnected = false;
+    let state = null;
     try {
+        state = await session.client.getState().catch(() => null);
+        isActuallyConnected = state === 'CONNECTED';
+        console.log(`[${sessionId}] 📊 État réel du client: ${state || 'inconnu'}`);
+        
+        if (!isActuallyConnected) {
+            console.log(`[${sessionId}] ⚠️ Client marqué WORKING mais état réel = ${state}`);
+            session.status = 'DISCONNECTED';
+            session.error = `Client déconnecté (état: ${state})`;
+            return res.status(400).json({ 
+                ok: false, 
+                error: `Session déconnectée (état: ${state}). Veuillez utiliser /repair pour reconnecter.`,
+                status: session.status,
+                needsRepair: true
+            });
+        }
+    } catch (e) {
+        console.log(`[${sessionId}] ❌ Impossible de vérifier l'état: ${e.message}`);
+        session.status = 'DISCONNECTED';
+        session.error = e.message;
+        return res.status(400).json({ 
+            ok: false, 
+            error: 'Session déconnectée. Veuillez utiliser /repair pour reconnecter.',
+            status: 'DISCONNECTED',
+            needsRepair: true
+        });
+    }
+    // === FIN VÉRIFICATION ===
+
+    try {
+        console.log(`[${sessionId}] 📤 Envoi du message vers ${to}...`);
+        
         const sendWithRetry = async (attempt = 1, maxAttempts = 2) => {
             try {
                 const sendPromise = session.client.sendMessage(to, text);
                 const timeoutPromise = new Promise((_, reject) => 
                     setTimeout(() => reject(new Error('Timeout envoi message (60s)')), 60000)
                 );
-                return await Promise.race([sendPromise, timeoutPromise]);
+                const result = await Promise.race([sendPromise, timeoutPromise]);
+                console.log(`[${sessionId}] ✅ Message envoyé (tentative ${attempt})`);
+                return result;
             } catch (error) {
+                console.log(`[${sessionId}] ❌ Échec tentative ${attempt}: ${error.message}`);
                 if (attempt < maxAttempts && error.message.includes('Timeout')) {
-                    console.log(`[${sessionId}] Tentative ${attempt} échouée, réessai...`);
                     await new Promise(resolve => setTimeout(resolve, 2000));
                     return sendWithRetry(attempt + 1, maxAttempts);
                 }
@@ -591,17 +695,19 @@ app.post('/api/messages/send', async (req, res) => {
         });
         
     } catch (error) {
-        console.error(`[${sessionId}] Erreur envoi message:`, error.message);
+        console.error(`[${sessionId}] 💥 Erreur envoi message:`, error.message);
         
-        if (error.message.includes('closed') || error.message.includes('destroyed')) {
+        if (error.message.includes('closed') || error.message.includes('destroyed') || error.message.includes('Timeout')) {
             session.status = 'DISCONNECTED';
             session.error = error.message;
+            console.log(`[${sessionId}] ⚠️ Session marquée comme DISCONNECTED`);
         }
         
         res.status(500).json({ 
             ok: false, 
             error: error.message,
-            sessionStatus: session.status
+            sessionStatus: session.status,
+            needsRepair: true
         });
     }
 });
@@ -782,16 +888,37 @@ app.get('/api/stats', (req, res) => {
 });
 
 // ============================================
-// PING AUTOMATIQUE POUR GARDER LES SESSIONS ACTIVES
+// SURVEILLANCE ET RÉPARATION AUTOMATIQUE DES SESSIONS
 // ============================================
 setInterval(async () => {
     for (const [sessionId, session] of sessions) {
-        if (session.status === 'WORKING' && session.client && session.client.info) {
+        if (session.status === 'WORKING' && session.client) {
             try {
-                await session.client.getState();
-                console.log(`[${sessionId}] 🏓 Ping réussi`);
+                const state = await session.client.getState().catch(() => null);
+                console.log(`[${sessionId}] 🏓 Vérification état: ${state || 'inconnu'}`);
+                
+                if (state !== 'CONNECTED') {
+                    console.log(`[${sessionId}] ⚠️ État anormal: ${state}, tentative de reconnexion...`);
+                    
+                    // Tenter de réinitialiser la connexion
+                    try {
+                        await session.client.destroy();
+                    } catch (e) {}
+                    
+                    // Créer un nouveau client
+                    const newClient = await createClient(sessionId);
+                    session.client = newClient;
+                    session.status = 'STARTING';
+                    session.qr = null;
+                    session.error = null;
+                    await newClient.initialize();
+                    
+                    console.log(`[${sessionId}] 🔄 Reconnexion initiée`);
+                } else {
+                    session.lastActivity = Date.now();
+                }
             } catch (e) {
-                console.log(`[${sessionId}] ⚠️ Ping échoué, session peut être morte`);
+                console.log(`[${sessionId}] ❌ Erreur vérification: ${e.message}`);
                 session.status = 'DISCONNECTED';
                 session.error = e.message;
             }
@@ -813,6 +940,7 @@ app.listen(PORT, () => {
     console.log(`📍 POST   /api/messages/send-image    (image depuis URL ou base64)`);
     console.log(`📍 POST   /api/sessions/:sessionId/ping      (garder session active)`);
     console.log(`📍 POST   /api/sessions/:sessionId/logout    (déconnexion forcée)`);
+    console.log(`📍 POST   /api/sessions/:sessionId/repair    (réparation de session)`);
     console.log(`📍 GET    /api/sessions               (lister toutes les sessions)`);
     console.log(`📍 GET    /api/messages/:messageId/status`);
     console.log(`📍 GET    /api/health`);
