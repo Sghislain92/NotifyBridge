@@ -1,6 +1,7 @@
 const express = require('express');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
+const puppeteer = require('puppeteer');
 const puppeteerExtra = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
@@ -34,7 +35,7 @@ const puppeteerConfig = {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--single-process=false',
+        // '--single-process=false', // Removed as it can cause instability
         '--disable-web-resources',
         '--disable-default-apps',
         '--disable-preconnect',
@@ -68,8 +69,8 @@ const puppeteerConfig = {
         '--metrics-recording-only',
         '--no-zygote'
     ],
-    protocolTimeout: 600000,
-    timeout: 120000,
+protocolTimeout: 0,
+ timeout: 0,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
     ignoreHTTPSErrors: true
 };
@@ -85,9 +86,9 @@ const messageTracking = new Map();
 // ============================================
 async function createClient(sessionId) {
     try {
-        const client = new Client({
-            authStrategy: new LocalAuth({ clientId: sessionId }),
-            puppeteer: puppeteerConfig,
+const client = new Client({
+ authStrategy: new LocalAuth({ clientId: sessionId }),
+ puppeteer: puppeteerExtra,
             webVersionCache: {
                 type: 'remote',
                 remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/index.html'
