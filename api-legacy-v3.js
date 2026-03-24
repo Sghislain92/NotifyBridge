@@ -757,6 +757,26 @@ app.get('/api/stats', (req, res) => {
 });
 
 // ============================================
+// PING AUTOMATIQUE POUR GARDER LES SESSIONS ACTIVES
+// ============================================
+setInterval(async () => {
+    for (const [sessionId, session] of sessions) {
+        if (session.status === 'WORKING' && session.client && session.client.info) {
+            try {
+                // Ping silencieux pour garder la connexion active
+                await session.client.getState();
+                console.log(`[${sessionId}] 🏓 Ping réussi`);
+            } catch (e) {
+                console.log(`[${sessionId}] ⚠️ Ping échoué, session peut être morte`);
+                session.status = 'DISCONNECTED';
+                session.error = e.message;
+            }
+        }
+    }
+}, 30000); // Toutes les 30 secondes
+
+
+// ============================================
 // DÉMARRAGE
 // ============================================
 app.listen(PORT, () => {
