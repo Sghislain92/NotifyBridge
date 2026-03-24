@@ -1,4 +1,3 @@
-```javascript
 const express = require('express');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
@@ -72,7 +71,7 @@ const puppeteerConfig = {
     protocolTimeout: 600000,
     timeout: 120000,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
-    ignoreHTTPSErrors: true,
+    ignoreHTTPSErrors: true
 };
 
 // ============================================
@@ -95,7 +94,6 @@ async function createClient(sessionId) {
             }
         });
 
-        // Événement QR
         client.on('qr', async (qr) => {
             console.log(`[${sessionId}] QR Code généré`);
             const session = sessions.get(sessionId);
@@ -131,7 +129,6 @@ async function createClient(sessionId) {
             }
         });
 
-        // Événement READY - CORRIGÉ pour éviter les erreurs de propriétés manquantes
         client.on('ready', async () => {
             console.log(`[${sessionId}] ✅ Client prêt`);
             const session = sessions.get(sessionId);
@@ -141,7 +138,6 @@ async function createClient(sessionId) {
             session.lastActivity = Date.now();
 
             try {
-                // Récupération du numéro et du nom de base
                 let phoneNumber = null;
                 let pushname = null;
                 let wid = null;
@@ -156,7 +152,6 @@ async function createClient(sessionId) {
 
                 session.phoneNumber = phoneNumber;
 
-                // Construire userInfo de base
                 session.userInfo = {
                     wid: wid ? {
                         serialized: wid._serialized,
@@ -171,7 +166,6 @@ async function createClient(sessionId) {
                     battery: null
                 };
 
-                // Tentative de récupération des infos téléphone (optionnel, peut être absent)
                 try {
                     if (client.info && client.info.phone) {
                         session.userInfo.phone = {
@@ -186,7 +180,6 @@ async function createClient(sessionId) {
                     console.log(`[${sessionId}] Infos téléphone non disponibles`);
                 }
 
-                // Tentative de récupération batterie
                 try {
                     const batteryStatus = await client.getBatteryStatus();
                     if (batteryStatus) {
@@ -199,7 +192,6 @@ async function createClient(sessionId) {
                     console.log(`[${sessionId}] Batterie non disponible`);
                 }
 
-                // Récupération du contact avec retry
                 if (wid && wid._serialized) {
                     let contact = null;
                     for (let attempt = 0; attempt < 3; attempt++) {
@@ -234,7 +226,6 @@ async function createClient(sessionId) {
                             commonGroupsCount: 0
                         };
 
-                        // Récupération asynchrone non bloquante des infos supplémentaires
                         setTimeout(async () => {
                             try {
                                 const [countryCode, formattedNumber, profilePicUrl, about] = await Promise.allSettled([
@@ -250,7 +241,6 @@ async function createClient(sessionId) {
                             } catch (e) {}
                         }, 0);
                     } else {
-                        // Fallback minimal
                         session.contactInfo = {
                             number: phoneNumber,
                             pushname: pushname,
@@ -265,7 +255,6 @@ async function createClient(sessionId) {
             } catch (error) {
                 console.error(`[${sessionId}] Erreur récupération infos:`, error.message);
                 session.error = error.message;
-                // Fallback minimal
                 if (client.info && client.info.wid) {
                     session.phoneNumber = client.info.wid.user;
                     session.contactInfo = {
@@ -446,8 +435,6 @@ app.post('/api/sessions/:sessionId/ping', async (req, res) => {
     }
     
     try {
-        // Envoyer un ping léger pour garder la connexion active
-        // On vérifie simplement que le client répond
         const status = session.client.info ? 'active' : 'inactive';
         session.lastActivity = Date.now();
         
@@ -482,7 +469,6 @@ app.post('/api/sessions/:sessionId/logout', async (req, res) => {
             message: 'Déconnexion réussie. Vous pouvez maintenant reconnecter ce numéro ailleurs.'
         });
     } catch (error) {
-        // Forcer la suppression même en cas d'erreur
         sessions.delete(sessionId);
         res.json({ 
             ok: true, 
@@ -507,7 +493,6 @@ app.post('/api/messages/send', async (req, res) => {
         return res.status(404).json({ ok: false, error: 'Session non trouvée' });
     }
     
-    // Vérifier que la session est active
     if (session.status !== 'WORKING') {
         return res.status(400).json({ 
             ok: false, 
@@ -516,16 +501,13 @@ app.post('/api/messages/send', async (req, res) => {
         });
     }
 
-    // Vérifier que le client existe et est connecté
     if (!session.client || !session.client.info) {
         return res.status(400).json({ ok: false, error: 'Client WhatsApp non connecté' });
     }
 
     try {
-        // Fonction d'envoi avec retry (2 tentatives max)
         const sendWithRetry = async (attempt = 1, maxAttempts = 2) => {
             try {
-                // Timeout à 60 secondes (au lieu de 30)
                 const sendPromise = session.client.sendMessage(to, text);
                 const timeoutPromise = new Promise((_, reject) => 
                     setTimeout(() => reject(new Error('Timeout envoi message (60s)')), 60000)
@@ -582,7 +564,6 @@ app.post('/api/messages/send', async (req, res) => {
     } catch (error) {
         console.error(`[${sessionId}] Erreur envoi message:`, error.message);
         
-        // Si erreur de session, marquer comme déconnectée
         if (error.message.includes('closed') || error.message.includes('destroyed')) {
             session.status = 'DISCONNECTED';
             session.error = error.message;
@@ -619,7 +600,6 @@ app.post('/api/messages/send-image', async (req, res) => {
         let mediaBuffer = null;
 
         if (imageUrl) {
-            // Télécharger l'image avec timeout
             const fetchPromise = fetch(imageUrl);
             const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout téléchargement image (15s)')), 15000));
             const response = await Promise.race([fetchPromise, timeoutPromise]);
@@ -796,4 +776,3 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
 });
-```
