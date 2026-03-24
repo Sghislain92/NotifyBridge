@@ -482,6 +482,10 @@ app.post('/api/sessions/:sessionId/logout', async (req, res) => {
 // ============================================
 
 app.post('/api/messages/send', async (req, res) => {
+    console.log('=== REQUETE RECUE ===');
+    console.log('Headers:', req.headers);
+    console.log('Body:', req.body);
+    console.log('====================');
     const { sessionId, to, text, mentions, reactions } = req.body;
 
     if (!sessionId || !to || !text) {
