@@ -86,9 +86,13 @@ const messageTracking = new Map();
 // ============================================
 async function createClient(sessionId) {
     try {
-const client = new Client({
- authStrategy: new LocalAuth({ clientId: sessionId }),
- puppeteer: puppeteerExtra,
+        const client = new Client({
+            authStrategy: new LocalAuth({ clientId: sessionId }),
+            puppeteer: {
+                ...puppeteerConfig,
+                // On s'assure que puppeteer-extra est utilisé pour le stealth
+                _puppeteer: puppeteerExtra 
+            },
             webVersionCache: {
                 type: 'remote',
                 remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/index.html'
