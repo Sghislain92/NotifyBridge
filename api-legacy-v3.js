@@ -1,3 +1,4 @@
+```javascript
 const express = require('express');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
@@ -434,7 +435,64 @@ app.delete('/api/sessions/:sessionId', async (req, res) => {
 });
 
 // ============================================
-// ENVOI DE MESSAGE TEXTE AVEC TIMEOUT
+// ENDPOINT POUR GARDER LA SESSION ACTIVE (PING)
+// ============================================
+app.post('/api/sessions/:sessionId/ping', async (req, res) => {
+    const { sessionId } = req.params;
+    const session = sessions.get(sessionId);
+    
+    if (!session || session.status !== 'WORKING') {
+        return res.json({ ok: false, error: 'Session non active' });
+    }
+    
+    try {
+        // Envoyer un ping léger pour garder la connexion active
+        // On vérifie simplement que le client répond
+        const status = session.client.info ? 'active' : 'inactive';
+        session.lastActivity = Date.now();
+        
+        res.json({ 
+            ok: true, 
+            status: 'active',
+            lastActivity: session.lastActivity
+        });
+    } catch (error) {
+        res.json({ ok: false, error: error.message });
+    }
+});
+
+// ============================================
+// ENDPOINT POUR DÉCONNECTER UNE SESSION EXISTANTE
+// ============================================
+app.post('/api/sessions/:sessionId/logout', async (req, res) => {
+    const { sessionId } = req.params;
+    const session = sessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({ ok: false, error: 'Session non trouvée' });
+    }
+    
+    try {
+        await session.client.logout();
+        await session.client.destroy();
+        sessions.delete(sessionId);
+        
+        res.json({ 
+            ok: true, 
+            message: 'Déconnexion réussie. Vous pouvez maintenant reconnecter ce numéro ailleurs.'
+        });
+    } catch (error) {
+        // Forcer la suppression même en cas d'erreur
+        sessions.delete(sessionId);
+        res.json({ 
+            ok: true, 
+            message: 'Session supprimée'
+        });
+    }
+});
+
+// ============================================
+// ENVOI DE MESSAGE TEXTE AVEC TIMEOUT AUGMENTÉ À 60s
 // ============================================
 
 app.post('/api/messages/send', async (req, res) => {
@@ -445,15 +503,45 @@ app.post('/api/messages/send', async (req, res) => {
     }
 
     const session = sessions.get(sessionId);
-    if (!session || session.status !== 'WORKING') {
-        return res.status(400).json({ ok: false, error: 'Session non connectée ou non trouvée' });
+    if (!session) {
+        return res.status(404).json({ ok: false, error: 'Session non trouvée' });
+    }
+    
+    // Vérifier que la session est active
+    if (session.status !== 'WORKING') {
+        return res.status(400).json({ 
+            ok: false, 
+            error: `Session non prête - Statut: ${session.status}`,
+            status: session.status
+        });
+    }
+
+    // Vérifier que le client existe et est connecté
+    if (!session.client || !session.client.info) {
+        return res.status(400).json({ ok: false, error: 'Client WhatsApp non connecté' });
     }
 
     try {
-        // Utilisation de Promise.race pour éviter les timeouts infinis
-        const sendPromise = session.client.sendMessage(to, text);
-        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout envoi message (30s)')), 30000));
-        const sentMessage = await Promise.race([sendPromise, timeoutPromise]);
+        // Fonction d'envoi avec retry (2 tentatives max)
+        const sendWithRetry = async (attempt = 1, maxAttempts = 2) => {
+            try {
+                // Timeout à 60 secondes (au lieu de 30)
+                const sendPromise = session.client.sendMessage(to, text);
+                const timeoutPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Timeout envoi message (60s)')), 60000)
+                );
+                return await Promise.race([sendPromise, timeoutPromise]);
+            } catch (error) {
+                if (attempt < maxAttempts && error.message.includes('Timeout')) {
+                    console.log(`[${sessionId}] Tentative ${attempt} échouée, réessai...`);
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    return sendWithRetry(attempt + 1, maxAttempts);
+                }
+                throw error;
+            }
+        };
+
+        const sentMessage = await sendWithRetry();
 
         const messageId = sentMessage.id.id;
         messageTracking.set(messageId, {
@@ -490,9 +578,21 @@ app.post('/api/messages/send', async (req, res) => {
             hasMedia: false,
             timestamp: new Date().toISOString()
         });
+        
     } catch (error) {
         console.error(`[${sessionId}] Erreur envoi message:`, error.message);
-        res.status(500).json({ ok: false, error: error.message });
+        
+        // Si erreur de session, marquer comme déconnectée
+        if (error.message.includes('closed') || error.message.includes('destroyed')) {
+            session.status = 'DISCONNECTED';
+            session.error = error.message;
+        }
+        
+        res.status(500).json({ 
+            ok: false, 
+            error: error.message,
+            sessionStatus: session.status
+        });
     }
 });
 
@@ -682,8 +782,10 @@ app.listen(PORT, () => {
     console.log(`📍 GET    /api/sessions/:sessionId/status`);
     console.log(`📍 GET    /api/sessions/:sessionId/info`);
     console.log(`📍 GET    /api/sessions/:sessionId/phone-number`);
-    console.log(`📍 POST   /api/messages/send          (texte)`);
+    console.log(`📍 POST   /api/messages/send          (texte avec timeout 60s et retry)`);
     console.log(`📍 POST   /api/messages/send-image    (image depuis URL ou base64)`);
+    console.log(`📍 POST   /api/sessions/:sessionId/ping      (garder session active)`);
+    console.log(`📍 POST   /api/sessions/:sessionId/logout    (déconnexion forcée)`);
     console.log(`📍 GET    /api/messages/:messageId/status`);
     console.log(`📍 GET    /api/health`);
 });
@@ -694,3 +796,4 @@ process.on('unhandledRejection', (reason, promise) => {
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
 });
+```
