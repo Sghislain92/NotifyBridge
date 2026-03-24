@@ -478,6 +478,31 @@ app.post('/api/sessions/:sessionId/logout', async (req, res) => {
 });
 
 // ============================================
+// ENDPOINT POUR LISTER LES SESSIONS (DIAGNOSTIC)
+// ============================================
+app.get('/api/sessions', (req, res) => {
+    const sessionList = [];
+    sessions.forEach((session, sessionId) => {
+        sessionList.push({
+            sessionId,
+            status: session.status,
+            phoneNumber: session.phoneNumber,
+            pushname: session.contactInfo?.pushname,
+            messagesCount: session.messagesCount,
+            lastActivity: session.lastActivity,
+            hasClient: !!session.client,
+            hasInfo: !!(session.client && session.client.info),
+            qr: !!session.qr
+        });
+    });
+    res.json({
+        ok: true,
+        activeSessions: sessions.size,
+        sessions: sessionList
+    });
+});
+
+// ============================================
 // ENVOI DE MESSAGE TEXTE AVEC TIMEOUT AUGMENTÉ À 60s
 // ============================================
 
@@ -763,7 +788,6 @@ setInterval(async () => {
     for (const [sessionId, session] of sessions) {
         if (session.status === 'WORKING' && session.client && session.client.info) {
             try {
-                // Ping silencieux pour garder la connexion active
                 await session.client.getState();
                 console.log(`[${sessionId}] 🏓 Ping réussi`);
             } catch (e) {
@@ -774,7 +798,6 @@ setInterval(async () => {
         }
     }
 }, 30000); // Toutes les 30 secondes
-
 
 // ============================================
 // DÉMARRAGE
@@ -790,6 +813,7 @@ app.listen(PORT, () => {
     console.log(`📍 POST   /api/messages/send-image    (image depuis URL ou base64)`);
     console.log(`📍 POST   /api/sessions/:sessionId/ping      (garder session active)`);
     console.log(`📍 POST   /api/sessions/:sessionId/logout    (déconnexion forcée)`);
+    console.log(`📍 GET    /api/sessions               (lister toutes les sessions)`);
     console.log(`📍 GET    /api/messages/:messageId/status`);
     console.log(`📍 GET    /api/health`);
 });
