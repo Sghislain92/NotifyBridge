@@ -68,8 +68,8 @@ const puppeteerConfig = {
         '--metrics-recording-only',
         '--no-zygote'
     ],
-    protocolTimeout: 120000, // 2 minutes pour les opérations protocol
-    timeout: 60000,
+    protocolTimeout: 600000,
+    timeout: 120000,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
     ignoreHTTPSErrors: true,
 };
