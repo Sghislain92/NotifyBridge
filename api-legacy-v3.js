@@ -535,6 +535,61 @@ app.post('/api/sessions/close-all', async (req, res) => {
 });
 
 // ============================================
+// ENDPOINT POUR NETTOYER LES SESSIONS ORPHELINES
+// ============================================
+app.post('/api/sessions/cleanup-orphans', async (req, res) => {
+    const cleaned = [];
+    const toDelete = [];
+    
+    for (const [sessionId, session] of sessions) {
+        // Supprimer les sessions bloquées en STARTING depuis plus de 2 minutes
+        if (session.status === 'STARTING' && session.createdAt) {
+            const age = Date.now() - new Date(session.createdAt).getTime();
+            if (age > 120000) { // 2 minutes
+                toDelete.push({ sessionId, reason: 'STARTING timeout', age });
+            }
+        }
+        
+        // Supprimer les sessions SCAN_QR sans QR depuis trop longtemps
+        if (session.status === 'SCAN_QR' && session.lastActivity) {
+            const idle = Date.now() - session.lastActivity;
+            if (idle > 180000) { // 3 minutes sans activité
+                toDelete.push({ sessionId, reason: 'SCAN_QR idle', idle });
+            }
+        }
+        
+        // Supprimer les sessions DISCONNECTED
+        if (session.status === 'DISCONNECTED') {
+            toDelete.push({ sessionId, reason: 'DISCONNECTED' });
+        }
+    }
+    
+    for (const { sessionId, reason } of toDelete) {
+        const session = sessions.get(sessionId);
+        try {
+            if (session && session.client) {
+                try { await session.client.logout(); } catch (e) {}
+                try { await session.client.destroy(); } catch (e) {}
+            }
+            sessions.delete(sessionId);
+            cleaned.push({ sessionId, reason });
+            console.log(`🗑️ Session orpheline supprimée: ${sessionId} (${reason})`);
+        } catch (e) {
+            sessions.delete(sessionId);
+            cleaned.push({ sessionId, reason, error: e.message });
+        }
+    }
+    
+    res.json({
+        ok: true,
+        message: `${cleaned.length} sessions orphelines nettoyées`,
+        cleaned,
+        remainingSessions: sessions.size
+    });
+});
+
+
+// ============================================
 // ENDPOINT POUR LISTER LES SESSIONS (DIAGNOSTIC)
 // ============================================
 app.get('/api/sessions', (req, res) => {
