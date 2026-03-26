@@ -483,6 +483,58 @@ app.post('/api/sessions/:sessionId/logout', async (req, res) => {
 });
 
 // ============================================
+// ENDPOINT POUR FERMER TOUTES LES SESSIONS
+// ============================================
+app.post('/api/sessions/close-all', async (req, res) => {
+    const closedSessions = [];
+    const errors = [];
+    
+    console.log(`🧹 Fermeture de toutes les sessions (${sessions.size} actives)...`);
+    
+    for (const [sessionId, session] of sessions) {
+        try {
+            console.log(`🗑️ Fermeture de la session: ${sessionId} (${session.status})`);
+            
+            if (session.client) {
+                try {
+                    await session.client.logout();
+                } catch (e) {
+                    console.log(`Erreur logout pour ${sessionId}: ${e.message}`);
+                }
+                try {
+                    await session.client.destroy();
+                } catch (e) {
+                    console.log(`Erreur destroy pour ${sessionId}: ${e.message}`);
+                }
+            }
+            
+            sessions.delete(sessionId);
+            closedSessions.push({
+                sessionId,
+                previousStatus: session.status,
+                phoneNumber: session.phoneNumber
+            });
+            
+        } catch (error) {
+            console.error(`Erreur fermeture session ${sessionId}:`, error.message);
+            errors.push({ sessionId, error: error.message });
+            // Forcer la suppression même en cas d'erreur
+            sessions.delete(sessionId);
+        }
+    }
+    
+    console.log(`✅ ${closedSessions.length} sessions fermées, ${errors.length} erreurs`);
+    
+    res.json({
+        ok: true,
+        message: `${closedSessions.length} sessions fermées`,
+        closedSessions,
+        errors,
+        remainingSessions: sessions.size
+    });
+});
+
+// ============================================
 // ENDPOINT POUR LISTER LES SESSIONS (DIAGNOSTIC)
 // ============================================
 app.get('/api/sessions', (req, res) => {
