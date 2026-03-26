@@ -69,8 +69,8 @@ const puppeteerConfig = {
         '--metrics-recording-only',
         '--no-zygote'
     ],
-protocolTimeout: 0,
- timeout: 0,
+    protocolTimeout: 0,
+    timeout: 0,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
     ignoreHTTPSErrors: true
 };
@@ -275,6 +275,8 @@ async function createClient(sessionId) {
             const session = sessions.get(sessionId);
             if (session) {
                 session.status = 'DISCONNECTED';
+                session.disconnectReason = reason; // Stocker la raison de déconnexion
+                session.disconnectedAt = new Date().toISOString(); // Date de déconnexion
                 session.lastActivity = Date.now();
             }
         });
@@ -335,7 +337,9 @@ app.post('/api/sessions/:sessionId/start', async (req, res) => {
             messagesCount: 0,
             error: null,
             userInfo: null,
-            contactInfo: null
+            contactInfo: null,
+            disconnectReason: null,      // Raison de déconnexion
+            disconnectedAt: null         // Date de déconnexion
         });
 
         await client.initialize();
@@ -512,7 +516,9 @@ app.post('/api/sessions/close-all', async (req, res) => {
             closedSessions.push({
                 sessionId,
                 previousStatus: session.status,
-                phoneNumber: session.phoneNumber
+                phoneNumber: session.phoneNumber,
+                disconnectReason: session.disconnectReason,
+                disconnectedAt: session.disconnectedAt
             });
             
         } catch (error) {
@@ -558,7 +564,7 @@ app.post('/api/sessions/cleanup-orphans', async (req, res) => {
             }
         }
         
-        // Supprimer les sessions DISCONNECTED
+        // Supprimer les sessions DISCONNECTED (peu importe la raison)
         if (session.status === 'DISCONNECTED') {
             toDelete.push({ sessionId, reason: 'DISCONNECTED' });
         }
@@ -572,7 +578,12 @@ app.post('/api/sessions/cleanup-orphans', async (req, res) => {
                 try { await session.client.destroy(); } catch (e) {}
             }
             sessions.delete(sessionId);
-            cleaned.push({ sessionId, reason });
+            cleaned.push({ 
+                sessionId, 
+                reason, 
+                disconnectReason: session?.disconnectReason || null,
+                disconnectedAt: session?.disconnectedAt || null
+            });
             console.log(`🗑️ Session orpheline supprimée: ${sessionId} (${reason})`);
         } catch (e) {
             sessions.delete(sessionId);
@@ -587,7 +598,6 @@ app.post('/api/sessions/cleanup-orphans', async (req, res) => {
         remainingSessions: sessions.size
     });
 });
-
 
 // ============================================
 // ENDPOINT POUR LISTER LES SESSIONS (DIAGNOSTIC)
@@ -604,13 +614,50 @@ app.get('/api/sessions', (req, res) => {
             lastActivity: session.lastActivity,
             hasClient: !!session.client,
             hasInfo: !!(session.client && session.client.info),
-            qr: !!session.qr
+            qr: !!session.qr,
+            disconnectReason: session.disconnectReason || null,
+            disconnectedAt: session.disconnectedAt || null
         });
     });
     res.json({
         ok: true,
         activeSessions: sessions.size,
         sessions: sessionList
+    });
+});
+
+// ============================================
+// ENDPOINT POUR CONNAÎTRE LA RAISON DE DÉCONNEXION
+// ============================================
+app.get('/api/sessions/:sessionId/disconnect-info', (req, res) => {
+    const { sessionId } = req.params;
+    const session = sessions.get(sessionId);
+    
+    if (!session) {
+        return res.status(404).json({ ok: false, error: 'Session non trouvée' });
+    }
+    
+    // Message explicatif selon la raison
+    let message = 'Session active ou raison inconnue';
+    if (session.disconnectReason === 'LOGOUT') {
+        message = 'L\'utilisateur s\'est déconnecté volontairement depuis son téléphone';
+    } else if (session.disconnectReason === 'REMOTE_LOGOUT') {
+        message = 'WhatsApp a déconnecté cet appareil à distance (suppression de l\'appareil)';
+    } else if (session.disconnectReason === 'ACCOUNT_REMOVED') {
+        message = 'Le compte WhatsApp a été supprimé';
+    } else if (session.disconnectReason === 'SESSION_REMOVED') {
+        message = 'La session WhatsApp a été supprimée';
+    } else if (session.disconnectReason) {
+        message = `Déconnecté pour raison: ${session.disconnectReason}`;
+    }
+    
+    res.json({
+        ok: true,
+        sessionId,
+        status: session.status,
+        disconnectReason: session.disconnectReason || null,
+        disconnectedAt: session.disconnectedAt || null,
+        message: message
     });
 });
 
@@ -665,6 +712,8 @@ app.post('/api/sessions/:sessionId/repair', async (req, res) => {
         session.qr = null;
         session.error = null;
         session.lastActivity = Date.now();
+        session.disconnectReason = null;
+        session.disconnectedAt = null;
         
         await newClient.initialize();
         
@@ -993,7 +1042,9 @@ app.get('/api/stats', (req, res) => {
             status: session.status,
             phoneNumber: session.phoneNumber,
             pushname: session.contactInfo?.pushname,
-            messagesCount: session.messagesCount
+            messagesCount: session.messagesCount,
+            disconnectReason: session.disconnectReason || null,
+            disconnectedAt: session.disconnectedAt || null
         });
     });
     res.json({ ok: true, timestamp: new Date().toISOString(), stats });
@@ -1023,6 +1074,8 @@ setInterval(async () => {
                     session.status = 'STARTING';
                     session.qr = null;
                     session.error = null;
+                    session.disconnectReason = null;
+                    session.disconnectedAt = null;
                     await newClient.initialize();
                     
                     console.log(`[${sessionId}] 🔄 Reconnexion initiée`);
@@ -1052,8 +1105,11 @@ app.listen(PORT, () => {
     console.log(`📍 POST   /api/messages/send-image    (image depuis URL ou base64)`);
     console.log(`📍 POST   /api/sessions/:sessionId/ping      (garder session active)`);
     console.log(`📍 POST   /api/sessions/:sessionId/logout    (déconnexion forcée)`);
-    console.log(`📍 POST   /api/sessions/:sessionId/repair    (réparation de session)`);
-    console.log(`📍 GET    /api/sessions               (lister toutes les sessions)`);
+    console.log(`📍 POST   /api/sessions/close-all           (fermer toutes les sessions)`);
+    console.log(`📍 POST   /api/sessions/cleanup-orphans     (nettoyer sessions orphelines)`);
+    console.log(`📍 POST   /api/sessions/:sessionId/repair   (réparation de session)`);
+    console.log(`📍 GET    /api/sessions                    (lister toutes les sessions)`);
+    console.log(`📍 GET    /api/sessions/:sessionId/disconnect-info (raison de déconnexion)`);
     console.log(`📍 GET    /api/messages/:messageId/status`);
     console.log(`📍 GET    /api/health`);
 });
