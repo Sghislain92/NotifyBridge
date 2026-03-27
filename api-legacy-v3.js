@@ -1,5 +1,5 @@
 const express = require('express');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const puppeteer = require('puppeteer');
 const puppeteerExtra = require('puppeteer-extra');
@@ -35,7 +35,6 @@ const puppeteerConfig = {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        // '--single-process=false', // Removed as it can cause instability
         '--disable-web-resources',
         '--disable-default-apps',
         '--disable-preconnect',
@@ -82,6 +81,26 @@ const sessions = new Map();
 const messageTracking = new Map();
 
 // ============================================
+// WEBHOOKS STORAGE (sessionId -> url)
+// ============================================
+const webhooks = new Map();
+
+// Helper function to send webhook events
+async function sendWebhook(sessionId, event, data) {
+    const url = webhooks.get(sessionId);
+    if (!url) return;
+    try {
+        await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId, event, data, timestamp: new Date().toISOString() })
+        });
+    } catch (e) {
+        console.error(`[${sessionId}] Webhook error:`, e.message);
+    }
+}
+
+// ============================================
 // FONCTION DE CRÉATION D'UN CLIENT
 // ============================================
 async function createClient(sessionId) {
@@ -90,8 +109,7 @@ async function createClient(sessionId) {
             authStrategy: new LocalAuth({ clientId: sessionId }),
             puppeteer: {
                 ...puppeteerConfig,
-                // On s'assure que puppeteer-extra est utilisé pour le stealth
-                _puppeteer: puppeteerExtra 
+                _puppeteer: puppeteerExtra
             },
             webVersionCache: {
                 type: 'remote',
@@ -113,6 +131,7 @@ async function createClient(sessionId) {
                 }
                 session.lastActivity = Date.now();
             }
+            sendWebhook(sessionId, 'qr', { qr: session?.qr });
         });
 
         client.on('authenticated', () => {
@@ -122,6 +141,7 @@ async function createClient(sessionId) {
                 session.status = 'AUTHENTICATED';
                 session.lastActivity = Date.now();
             }
+            sendWebhook(sessionId, 'authenticated', {});
         });
 
         client.on('auth_failure', (msg) => {
@@ -132,6 +152,7 @@ async function createClient(sessionId) {
                 session.error = msg;
                 session.lastActivity = Date.now();
             }
+            sendWebhook(sessionId, 'auth_failure', { error: msg });
         });
 
         client.on('ready', async () => {
@@ -257,6 +278,7 @@ async function createClient(sessionId) {
                 }
 
                 console.log(`[${sessionId}] ✅ Session prête - Numéro: ${phoneNumber || 'inconnu'} - Nom: ${pushname || 'Non défini'}`);
+                sendWebhook(sessionId, 'ready', { phoneNumber, pushname });
             } catch (error) {
                 console.error(`[${sessionId}] Erreur récupération infos:`, error.message);
                 session.error = error.message;
@@ -267,7 +289,63 @@ async function createClient(sessionId) {
                         pushname: client.info.pushname || null
                     };
                 }
+                sendWebhook(sessionId, 'error', { error: error.message });
             }
+        });
+
+        client.on('message', async (message) => {
+            console.log(`[${sessionId}] 📨 Message reçu de ${message.from}: ${message.body}`);
+            const session = sessions.get(sessionId);
+            if (session) {
+                session.lastActivity = Date.now();
+                // Stocker le message entrant dans messageTracking? Optionnel.
+            }
+            // Envoyer le webhook
+            sendWebhook(sessionId, 'message', {
+                id: message.id.id,
+                from: message.from,
+                to: message.to,
+                body: message.body,
+                type: message.type,
+                timestamp: message.timestamp,
+                hasMedia: message.hasMedia,
+                isGroup: message.isGroup,
+                fromMe: message.fromMe
+            });
+        });
+
+        client.on('message_create', (message) => {
+            // Similar to message, but includes messages sent by the client itself
+            sendWebhook(sessionId, 'message_create', { id: message.id.id, from: message.from, body: message.body });
+        });
+
+        client.on('message_revoke_everyone', (after, before) => {
+            sendWebhook(sessionId, 'message_revoke_everyone', { afterId: after.id.id, beforeId: before?.id.id });
+        });
+
+        client.on('message_revoke_me', (message) => {
+            sendWebhook(sessionId, 'message_revoke_me', { id: message.id.id });
+        });
+
+        client.on('message_ack', (msg, ack) => {
+            const ackStatus = ['pending', 'sent', 'delivered', 'read', 'played'][ack] || 'unknown';
+            sendWebhook(sessionId, 'message_ack', { id: msg.id.id, ack, status: ackStatus });
+        });
+
+        client.on('group_join', (notification) => {
+            sendWebhook(sessionId, 'group_join', { id: notification.id, chatId: notification.chatId, author: notification.author });
+        });
+
+        client.on('group_leave', (notification) => {
+            sendWebhook(sessionId, 'group_leave', { id: notification.id, chatId: notification.chatId, author: notification.author });
+        });
+
+        client.on('group_update', (notification) => {
+            sendWebhook(sessionId, 'group_update', { id: notification.id, chatId: notification.chatId, author: notification.author, body: notification.body });
+        });
+
+        client.on('change_state', (state) => {
+            sendWebhook(sessionId, 'change_state', { state });
         });
 
         client.on('disconnected', (reason) => {
@@ -275,10 +353,11 @@ async function createClient(sessionId) {
             const session = sessions.get(sessionId);
             if (session) {
                 session.status = 'DISCONNECTED';
-                session.disconnectReason = reason; // Stocker la raison de déconnexion
-                session.disconnectedAt = new Date().toISOString(); // Date de déconnexion
+                session.disconnectReason = reason;
+                session.disconnectedAt = new Date().toISOString();
                 session.lastActivity = Date.now();
             }
+            sendWebhook(sessionId, 'disconnected', { reason });
         });
 
         client.on('error', (error) => {
@@ -288,6 +367,7 @@ async function createClient(sessionId) {
                 session.error = error.message;
                 session.lastActivity = Date.now();
             }
+            sendWebhook(sessionId, 'error', { error: error.message });
         });
 
         client.on('message_ack', (msg, ack) => {
@@ -299,6 +379,8 @@ async function createClient(sessionId) {
                 msgData.ack = ack;
                 msgData.lastUpdate = new Date().toISOString();
             }
+            // Also forward via webhook
+            sendWebhook(sessionId, 'message_ack', { id: messageId, ack, status: ackStatus });
         });
 
         return client;
@@ -309,7 +391,7 @@ async function createClient(sessionId) {
 }
 
 // ============================================
-// ENDPOINTS SESSIONS
+// ENDPOINTS SESSIONS (déjà existants)
 // ============================================
 
 app.post('/api/sessions/:sessionId/start', async (req, res) => {
@@ -338,8 +420,8 @@ app.post('/api/sessions/:sessionId/start', async (req, res) => {
             error: null,
             userInfo: null,
             contactInfo: null,
-            disconnectReason: null,      // Raison de déconnexion
-            disconnectedAt: null         // Date de déconnexion
+            disconnectReason: null,
+            disconnectedAt: null
         });
 
         await client.initialize();
@@ -424,152 +506,708 @@ app.delete('/api/sessions/:sessionId', async (req, res) => {
         await session.client.logout();
         await session.client.destroy();
         sessions.delete(sessionId);
+        webhooks.delete(sessionId);
         res.json({ ok: true, message: 'Session détruite' });
     } catch (error) {
         console.error(`[${sessionId}] Erreur suppression:`, error.message);
         sessions.delete(sessionId);
+        webhooks.delete(sessionId);
         res.json({ ok: true, message: 'Session détruite (avec erreur)' });
     }
 });
 
 // ============================================
-// ENDPOINT POUR GARDER LA SESSION ACTIVE (PING)
+// ENDPOINTS WEBHOOK
 // ============================================
+
+app.post('/api/sessions/:sessionId/webhook', (req, res) => {
+    const { sessionId } = req.params;
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ ok: false, error: 'url required' });
+    webhooks.set(sessionId, url);
+    res.json({ ok: true, message: 'Webhook configured', url });
+});
+
+app.delete('/api/sessions/:sessionId/webhook', (req, res) => {
+    const { sessionId } = req.params;
+    webhooks.delete(sessionId);
+    res.json({ ok: true, message: 'Webhook removed' });
+});
+
+// ============================================
+// ENVOI DE MÉDIAS (nouveaux endpoints)
+// ============================================
+
+// Helper to fetch media buffer with timeout
+async function fetchMedia(url, timeout = 15000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return Buffer.from(await response.arrayBuffer());
+    } catch (err) {
+        clearTimeout(timeoutId);
+        throw err;
+    }
+}
+
+app.post('/api/messages/send-video', async (req, res) => {
+    const { sessionId, to, caption, videoUrl, videoBase64 } = req.body;
+    if (!sessionId || !to) return res.status(400).json({ ok: false, error: 'sessionId and to required' });
+    if (!videoUrl && !videoBase64) return res.status(400).json({ ok: false, error: 'videoUrl or videoBase64 required' });
+
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        let mediaBuffer;
+        if (videoUrl) {
+            mediaBuffer = await fetchMedia(videoUrl, 30000);
+        } else {
+            let base64Data = videoBase64;
+            if (base64Data.includes('base64,')) base64Data = base64Data.split('base64,')[1];
+            mediaBuffer = Buffer.from(base64Data, 'base64');
+        }
+        const media = new MessageMedia('video/mp4', mediaBuffer.toString('base64'), 'video.mp4');
+        const sentMessage = await session.client.sendMessage(to, media, { caption: caption || '' });
+        const messageId = sentMessage.id.id;
+        messageTracking.set(messageId, {
+            messageId, sessionId, to, text: caption || '', status: 'sent', ack: 1,
+            timestamp: new Date().toISOString(), lastUpdate: new Date().toISOString(),
+            hasMedia: true, mediaType: 'video',
+            fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
+        });
+        session.messagesCount++;
+        res.json({ ok: true, message: 'Video envoyée', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'video', timestamp: new Date().toISOString() });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur envoi vidéo:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/messages/send-audio', async (req, res) => {
+    const { sessionId, to, audioUrl, audioBase64, asVoice = true } = req.body;
+    if (!sessionId || !to) return res.status(400).json({ ok: false, error: 'sessionId and to required' });
+    if (!audioUrl && !audioBase64) return res.status(400).json({ ok: false, error: 'audioUrl or audioBase64 required' });
+
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        let mediaBuffer;
+        if (audioUrl) {
+            mediaBuffer = await fetchMedia(audioUrl, 30000);
+        } else {
+            let base64Data = audioBase64;
+            if (base64Data.includes('base64,')) base64Data = base64Data.split('base64,')[1];
+            mediaBuffer = Buffer.from(base64Data, 'base64');
+        }
+        const media = new MessageMedia('audio/mpeg', mediaBuffer.toString('base64'), 'audio.mp3');
+        const sentMessage = await session.client.sendMessage(to, media, { sendAudioAsVoice: asVoice });
+        const messageId = sentMessage.id.id;
+        messageTracking.set(messageId, {
+            messageId, sessionId, to, text: '', status: 'sent', ack: 1,
+            timestamp: new Date().toISOString(), lastUpdate: new Date().toISOString(),
+            hasMedia: true, mediaType: asVoice ? 'voice' : 'audio',
+            fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
+        });
+        session.messagesCount++;
+        res.json({ ok: true, message: asVoice ? 'Message vocal envoyé' : 'Audio envoyé', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: asVoice ? 'voice' : 'audio', timestamp: new Date().toISOString() });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur envoi audio:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/messages/send-file', async (req, res) => {
+    const { sessionId, to, caption, fileUrl, fileBase64, fileName } = req.body;
+    if (!sessionId || !to) return res.status(400).json({ ok: false, error: 'sessionId and to required' });
+    if (!fileUrl && !fileBase64) return res.status(400).json({ ok: false, error: 'fileUrl or fileBase64 required' });
+
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        let mediaBuffer;
+        if (fileUrl) {
+            mediaBuffer = await fetchMedia(fileUrl, 60000);
+        } else {
+            let base64Data = fileBase64;
+            if (base64Data.includes('base64,')) base64Data = base64Data.split('base64,')[1];
+            mediaBuffer = Buffer.from(base64Data, 'base64');
+        }
+        const media = new MessageMedia('application/octet-stream', mediaBuffer.toString('base64'), fileName || 'file');
+        const sentMessage = await session.client.sendMessage(to, media, { caption: caption || '' });
+        const messageId = sentMessage.id.id;
+        messageTracking.set(messageId, {
+            messageId, sessionId, to, text: caption || '', status: 'sent', ack: 1,
+            timestamp: new Date().toISOString(), lastUpdate: new Date().toISOString(),
+            hasMedia: true, mediaType: 'file', fileName: fileName || 'file',
+            fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
+        });
+        session.messagesCount++;
+        res.json({ ok: true, message: 'Fichier envoyé', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'file', timestamp: new Date().toISOString() });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur envoi fichier:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/messages/send-sticker', async (req, res) => {
+    const { sessionId, to, stickerUrl, stickerBase64 } = req.body;
+    if (!sessionId || !to) return res.status(400).json({ ok: false, error: 'sessionId and to required' });
+    if (!stickerUrl && !stickerBase64) return res.status(400).json({ ok: false, error: 'stickerUrl or stickerBase64 required' });
+
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        let mediaBuffer;
+        if (stickerUrl) {
+            mediaBuffer = await fetchMedia(stickerUrl, 15000);
+        } else {
+            let base64Data = stickerBase64;
+            if (base64Data.includes('base64,')) base64Data = base64Data.split('base64,')[1];
+            mediaBuffer = Buffer.from(base64Data, 'base64');
+        }
+        const media = new MessageMedia('image/webp', mediaBuffer.toString('base64'), 'sticker.webp');
+        const sentMessage = await session.client.sendMessage(to, media, { sendMediaAsSticker: true });
+        const messageId = sentMessage.id.id;
+        messageTracking.set(messageId, {
+            messageId, sessionId, to, text: '', status: 'sent', ack: 1,
+            timestamp: new Date().toISOString(), lastUpdate: new Date().toISOString(),
+            hasMedia: true, mediaType: 'sticker',
+            fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
+        });
+        session.messagesCount++;
+        res.json({ ok: true, message: 'Sticker envoyé', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'sticker', timestamp: new Date().toISOString() });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur envoi sticker:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/messages/send-location', async (req, res) => {
+    const { sessionId, to, latitude, longitude, description } = req.body;
+    if (!sessionId || !to || latitude === undefined || longitude === undefined) return res.status(400).json({ ok: false, error: 'sessionId, to, latitude, longitude required' });
+
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const sentMessage = await session.client.sendMessage(to, new MessageMedia.Location(latitude, longitude, description || 'Location'));
+        const messageId = sentMessage.id.id;
+        messageTracking.set(messageId, {
+            messageId, sessionId, to, text: description || '', status: 'sent', ack: 1,
+            timestamp: new Date().toISOString(), lastUpdate: new Date().toISOString(),
+            hasMedia: true, mediaType: 'location',
+            fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
+        });
+        session.messagesCount++;
+        res.json({ ok: true, message: 'Location envoyée', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'location', timestamp: new Date().toISOString() });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur envoi location:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/messages/send-contact', async (req, res) => {
+    const { sessionId, to, contactName, contactNumber } = req.body;
+    if (!sessionId || !to || !contactName || !contactNumber) return res.status(400).json({ ok: false, error: 'sessionId, to, contactName, contactNumber required' });
+
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const vCard = `BEGIN:VCARD\nVERSION:3.0\nFN:${contactName}\nTEL;type=CELL:${contactNumber}\nEND:VCARD`;
+        const media = new MessageMedia('text/vcard', Buffer.from(vCard).toString('base64'), 'contact.vcf');
+        const sentMessage = await session.client.sendMessage(to, media);
+        const messageId = sentMessage.id.id;
+        messageTracking.set(messageId, {
+            messageId, sessionId, to, text: contactName, status: 'sent', ack: 1,
+            timestamp: new Date().toISOString(), lastUpdate: new Date().toISOString(),
+            hasMedia: true, mediaType: 'contact',
+            fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
+        });
+        session.messagesCount++;
+        res.json({ ok: true, message: 'Contact envoyé', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'contact', timestamp: new Date().toISOString() });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur envoi contact:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ============================================
+// GROUPES
+// ============================================
+
+app.post('/api/sessions/:sessionId/groups', async (req, res) => {
+    const { sessionId } = req.params;
+    const { name, participants } = req.body;
+    if (!name || !participants || !Array.isArray(participants)) return res.status(400).json({ ok: false, error: 'name and participants array required' });
+
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const group = await session.client.createGroup(name, participants);
+        res.json({ ok: true, groupId: group.gid._serialized, participants: group.participants });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur création groupe:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.get('/api/sessions/:sessionId/groups/:groupId', async (req, res) => {
+    const { sessionId, groupId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(groupId);
+        if (!chat.isGroup) return res.status(400).json({ ok: false, error: 'Not a group' });
+        const groupMetadata = await chat.getGroupMetadata();
+        res.json({ ok: true, group: { id: groupId, name: chat.name, description: chat.description, participants: groupMetadata.participants, owner: groupMetadata.owner } });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur récupération groupe:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/sessions/:sessionId/groups/:groupId/participants', async (req, res) => {
+    const { sessionId, groupId } = req.params;
+    const { add, remove } = req.body;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(groupId);
+        if (!chat.isGroup) return res.status(400).json({ ok: false, error: 'Not a group' });
+        if (add && add.length) await chat.addParticipants(add);
+        if (remove && remove.length) await chat.removeParticipants(remove);
+        res.json({ ok: true, message: 'Participants updated' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur modification participants:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.put('/api/sessions/:sessionId/groups/:groupId/subject', async (req, res) => {
+    const { sessionId, groupId } = req.params;
+    const { subject } = req.body;
+    if (!subject) return res.status(400).json({ ok: false, error: 'subject required' });
+
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(groupId);
+        if (!chat.isGroup) return res.status(400).json({ ok: false, error: 'Not a group' });
+        await chat.setSubject(subject);
+        res.json({ ok: true, message: 'Subject updated' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur modification sujet:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.put('/api/sessions/:sessionId/groups/:groupId/description', async (req, res) => {
+    const { sessionId, groupId } = req.params;
+    const { description } = req.body;
+    if (description === undefined) return res.status(400).json({ ok: false, error: 'description required' });
+
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(groupId);
+        if (!chat.isGroup) return res.status(400).json({ ok: false, error: 'Not a group' });
+        await chat.setDescription(description);
+        res.json({ ok: true, message: 'Description updated' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur modification description:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ============================================
+// CONTACTS
+// ============================================
+
+app.get('/api/sessions/:sessionId/contacts', async (req, res) => {
+    const { sessionId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const contacts = await session.client.getContacts();
+        const simple = contacts.map(c => ({ id: c.id._serialized, number: c.number, name: c.name, pushname: c.pushname, isMe: c.isMe, isGroup: c.isGroup, isBusiness: c.isBusiness }));
+        res.json({ ok: true, contacts: simple });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur récupération contacts:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.get('/api/sessions/:sessionId/contacts/:contactId', async (req, res) => {
+    const { sessionId, contactId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const contact = await session.client.getContactById(contactId);
+        const info = {
+            id: contact.id._serialized,
+            number: contact.number,
+            name: contact.name,
+            pushname: contact.pushname,
+            shortName: contact.shortName,
+            isMe: contact.isMe,
+            isMyContact: contact.isMyContact,
+            isBlocked: contact.isBlocked,
+            isBusiness: contact.isBusiness,
+            profilePicUrl: await contact.getProfilePicUrl(),
+            about: await contact.getAbout(),
+            countryCode: await contact.getCountryCode(),
+            formattedNumber: await contact.getFormattedNumber()
+        };
+        res.json({ ok: true, contact: info });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur récupération contact:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/sessions/:sessionId/contacts/:contactId/block', async (req, res) => {
+    const { sessionId, contactId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const contact = await session.client.getContactById(contactId);
+        await contact.block();
+        res.json({ ok: true, message: 'Contact bloqué' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur blocage contact:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/sessions/:sessionId/contacts/:contactId/unblock', async (req, res) => {
+    const { sessionId, contactId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const contact = await session.client.getContactById(contactId);
+        await contact.unblock();
+        res.json({ ok: true, message: 'Contact débloqué' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur déblocage contact:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ============================================
+// PRÉSENCE / TYPING
+// ============================================
+
+app.post('/api/sessions/:sessionId/chats/:chatId/typing', async (req, res) => {
+    const { sessionId, chatId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(chatId);
+        await chat.sendStateTyping();
+        res.json({ ok: true, message: 'Typing started' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur démarrage typing:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/sessions/:sessionId/chats/:chatId/recording', async (req, res) => {
+    const { sessionId, chatId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(chatId);
+        await chat.sendStateRecording();
+        res.json({ ok: true, message: 'Recording started' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur démarrage recording:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/sessions/:sessionId/chats/:chatId/clear-state', async (req, res) => {
+    const { sessionId, chatId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(chatId);
+        await chat.clearState();
+        res.json({ ok: true, message: 'State cleared' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur effacement state:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.get('/api/sessions/:sessionId/chats/:chatId/presence', async (req, res) => {
+    const { sessionId, chatId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const presence = await session.client.getPresence(chatId);
+        res.json({ ok: true, presence });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur récupération présence:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ============================================
+// GESTION DES MESSAGES (modification/suppression)
+// ============================================
+
+app.post('/api/messages/:messageId/edit', async (req, res) => {
+    const { messageId } = req.params;
+    const { newText } = req.body;
+    if (!newText) return res.status(400).json({ ok: false, error: 'newText required' });
+
+    // Find session and message
+    let session = null;
+    let msg = null;
+    for (const [sid, s] of sessions) {
+        const m = messageTracking.get(messageId);
+        if (m && m.sessionId === sid) {
+            session = s;
+            msg = m;
+            break;
+        }
+    }
+    if (!session || !msg) return res.status(404).json({ ok: false, error: 'Message not found' });
+
+    try {
+        const chat = await session.client.getChatById(msg.to);
+        const message = await chat.fetchMessage(messageId);
+        if (!message) return res.status(404).json({ ok: false, error: 'Message not found in chat' });
+        await message.edit(newText);
+        // Update tracking
+        msg.text = newText;
+        msg.lastUpdate = new Date().toISOString();
+        res.json({ ok: true, message: 'Message edited' });
+    } catch (error) {
+        console.error(`[${msg.sessionId}] Erreur édition message:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/messages/:messageId/delete', async (req, res) => {
+    const { messageId } = req.params;
+    const { everyone = false } = req.body;
+
+    // Find session and message
+    let session = null;
+    let msg = null;
+    for (const [sid, s] of sessions) {
+        const m = messageTracking.get(messageId);
+        if (m && m.sessionId === sid) {
+            session = s;
+            msg = m;
+            break;
+        }
+    }
+    if (!session || !msg) return res.status(404).json({ ok: false, error: 'Message not found' });
+
+    try {
+        const chat = await session.client.getChatById(msg.to);
+        const message = await chat.fetchMessage(messageId);
+        if (!message) return res.status(404).json({ ok: false, error: 'Message not found in chat' });
+        if (everyone) {
+            await message.delete(true);
+        } else {
+            await message.delete(false);
+        }
+        // Update tracking
+        msg.status = 'deleted';
+        msg.lastUpdate = new Date().toISOString();
+        res.json({ ok: true, message: 'Message deleted' });
+    } catch (error) {
+        console.error(`[${msg.sessionId}] Erreur suppression message:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ============================================
+// GESTION DES CHATS (archive, pin, etc.)
+// ============================================
+
+app.post('/api/sessions/:sessionId/chats/:chatId/archive', async (req, res) => {
+    const { sessionId, chatId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(chatId);
+        await chat.archive();
+        res.json({ ok: true, message: 'Chat archived' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur archivage chat:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/sessions/:sessionId/chats/:chatId/unarchive', async (req, res) => {
+    const { sessionId, chatId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(chatId);
+        await chat.unarchive();
+        res.json({ ok: true, message: 'Chat unarchived' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur désarchivage chat:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/sessions/:sessionId/chats/:chatId/pin', async (req, res) => {
+    const { sessionId, chatId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(chatId);
+        await chat.pin();
+        res.json({ ok: true, message: 'Chat pinned' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur épinglage chat:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.post('/api/sessions/:sessionId/chats/:chatId/unpin', async (req, res) => {
+    const { sessionId, chatId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chat = await session.client.getChatById(chatId);
+        await chat.unpin();
+        res.json({ ok: true, message: 'Chat unpinned' });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur désépinglage chat:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.get('/api/sessions/:sessionId/chats', async (req, res) => {
+    const { sessionId } = req.params;
+    const session = sessions.get(sessionId);
+    if (!session || session.status !== 'WORKING') return res.status(400).json({ ok: false, error: 'Session not working' });
+
+    try {
+        const chats = await session.client.getChats();
+        const simple = chats.map(c => ({
+            id: c.id._serialized,
+            name: c.name,
+            isGroup: c.isGroup,
+            unreadCount: c.unreadCount,
+            timestamp: c.timestamp,
+            archived: c.archived,
+            pinned: c.pinned
+        }));
+        res.json({ ok: true, chats: simple });
+    } catch (error) {
+        console.error(`[${sessionId}] Erreur récupération chats:`, error.message);
+        res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+// ============================================
+// ENDPOINTS EXISTANTS (PING, LOGOUT, CLOSE-ALL, etc.)
+// ============================================
+
 app.post('/api/sessions/:sessionId/ping', async (req, res) => {
     const { sessionId } = req.params;
     const session = sessions.get(sessionId);
-    
     if (!session || session.status !== 'WORKING') {
         return res.json({ ok: false, error: 'Session non active' });
     }
-    
     try {
         const status = session.client.info ? 'active' : 'inactive';
         session.lastActivity = Date.now();
-        
-        res.json({ 
-            ok: true, 
-            status: 'active',
-            lastActivity: session.lastActivity
-        });
+        res.json({ ok: true, status: 'active', lastActivity: session.lastActivity });
     } catch (error) {
         res.json({ ok: false, error: error.message });
     }
 });
 
-// ============================================
-// ENDPOINT POUR DÉCONNECTER UNE SESSION EXISTANTE
-// ============================================
 app.post('/api/sessions/:sessionId/logout', async (req, res) => {
     const { sessionId } = req.params;
     const session = sessions.get(sessionId);
-    
-    if (!session) {
-        return res.status(404).json({ ok: false, error: 'Session non trouvée' });
-    }
-    
+    if (!session) return res.status(404).json({ ok: false, error: 'Session non trouvée' });
     try {
         await session.client.logout();
         await session.client.destroy();
         sessions.delete(sessionId);
-        
-        res.json({ 
-            ok: true, 
-            message: 'Déconnexion réussie. Vous pouvez maintenant reconnecter ce numéro ailleurs.'
-        });
+        webhooks.delete(sessionId);
+        res.json({ ok: true, message: 'Déconnexion réussie. Vous pouvez maintenant reconnecter ce numéro ailleurs.' });
     } catch (error) {
         sessions.delete(sessionId);
-        res.json({ 
-            ok: true, 
-            message: 'Session supprimée'
-        });
+        webhooks.delete(sessionId);
+        res.json({ ok: true, message: 'Session supprimée' });
     }
 });
 
-// ============================================
-// ENDPOINT POUR FERMER TOUTES LES SESSIONS
-// ============================================
 app.post('/api/sessions/close-all', async (req, res) => {
     const closedSessions = [];
     const errors = [];
-    
     console.log(`🧹 Fermeture de toutes les sessions (${sessions.size} actives)...`);
-    
     for (const [sessionId, session] of sessions) {
         try {
             console.log(`🗑️ Fermeture de la session: ${sessionId} (${session.status})`);
-            
             if (session.client) {
-                try {
-                    await session.client.logout();
-                } catch (e) {
-                    console.log(`Erreur logout pour ${sessionId}: ${e.message}`);
-                }
-                try {
-                    await session.client.destroy();
-                } catch (e) {
-                    console.log(`Erreur destroy pour ${sessionId}: ${e.message}`);
-                }
+                try { await session.client.logout(); } catch (e) { console.log(`Erreur logout pour ${sessionId}: ${e.message}`); }
+                try { await session.client.destroy(); } catch (e) { console.log(`Erreur destroy pour ${sessionId}: ${e.message}`); }
             }
-            
             sessions.delete(sessionId);
-            closedSessions.push({
-                sessionId,
-                previousStatus: session.status,
-                phoneNumber: session.phoneNumber,
-                disconnectReason: session.disconnectReason,
-                disconnectedAt: session.disconnectedAt
-            });
-            
+            webhooks.delete(sessionId);
+            closedSessions.push({ sessionId, previousStatus: session.status, phoneNumber: session.phoneNumber, disconnectReason: session.disconnectReason, disconnectedAt: session.disconnectedAt });
         } catch (error) {
             console.error(`Erreur fermeture session ${sessionId}:`, error.message);
             errors.push({ sessionId, error: error.message });
-            // Forcer la suppression même en cas d'erreur
             sessions.delete(sessionId);
+            webhooks.delete(sessionId);
         }
     }
-    
     console.log(`✅ ${closedSessions.length} sessions fermées, ${errors.length} erreurs`);
-    
-    res.json({
-        ok: true,
-        message: `${closedSessions.length} sessions fermées`,
-        closedSessions,
-        errors,
-        remainingSessions: sessions.size
-    });
+    res.json({ ok: true, message: `${closedSessions.length} sessions fermées`, closedSessions, errors, remainingSessions: sessions.size });
 });
 
-// ============================================
-// ENDPOINT POUR NETTOYER LES SESSIONS ORPHELINES
-// ============================================
 app.post('/api/sessions/cleanup-orphans', async (req, res) => {
     const cleaned = [];
     const toDelete = [];
-    
     for (const [sessionId, session] of sessions) {
-        // Supprimer les sessions bloquées en STARTING depuis plus de 2 minutes
         if (session.status === 'STARTING' && session.createdAt) {
             const age = Date.now() - new Date(session.createdAt).getTime();
-            if (age > 120000) { // 2 minutes
-                toDelete.push({ sessionId, reason: 'STARTING timeout', age });
-            }
+            if (age > 120000) toDelete.push({ sessionId, reason: 'STARTING timeout', age });
         }
-        
-        // Supprimer les sessions SCAN_QR sans QR depuis trop longtemps
         if (session.status === 'SCAN_QR' && session.lastActivity) {
             const idle = Date.now() - session.lastActivity;
-            if (idle > 180000) { // 3 minutes sans activité
-                toDelete.push({ sessionId, reason: 'SCAN_QR idle', idle });
-            }
+            if (idle > 180000) toDelete.push({ sessionId, reason: 'SCAN_QR idle', idle });
         }
-        
-        // Supprimer les sessions DISCONNECTED (peu importe la raison)
-        if (session.status === 'DISCONNECTED') {
-            toDelete.push({ sessionId, reason: 'DISCONNECTED' });
-        }
+        if (session.status === 'DISCONNECTED') toDelete.push({ sessionId, reason: 'DISCONNECTED' });
     }
-    
     for (const { sessionId, reason } of toDelete) {
         const session = sessions.get(sessionId);
         try {
@@ -578,30 +1216,18 @@ app.post('/api/sessions/cleanup-orphans', async (req, res) => {
                 try { await session.client.destroy(); } catch (e) {}
             }
             sessions.delete(sessionId);
-            cleaned.push({ 
-                sessionId, 
-                reason, 
-                disconnectReason: session?.disconnectReason || null,
-                disconnectedAt: session?.disconnectedAt || null
-            });
+            webhooks.delete(sessionId);
+            cleaned.push({ sessionId, reason, disconnectReason: session?.disconnectReason || null, disconnectedAt: session?.disconnectedAt || null });
             console.log(`🗑️ Session orpheline supprimée: ${sessionId} (${reason})`);
         } catch (e) {
             sessions.delete(sessionId);
+            webhooks.delete(sessionId);
             cleaned.push({ sessionId, reason, error: e.message });
         }
     }
-    
-    res.json({
-        ok: true,
-        message: `${cleaned.length} sessions orphelines nettoyées`,
-        cleaned,
-        remainingSessions: sessions.size
-    });
+    res.json({ ok: true, message: `${cleaned.length} sessions orphelines nettoyées`, cleaned, remainingSessions: sessions.size });
 });
 
-// ============================================
-// ENDPOINT POUR LISTER LES SESSIONS (DIAGNOSTIC)
-// ============================================
 app.get('/api/sessions', (req, res) => {
     const sessionList = [];
     sessions.forEach((session, sessionId) => {
@@ -619,94 +1245,34 @@ app.get('/api/sessions', (req, res) => {
             disconnectedAt: session.disconnectedAt || null
         });
     });
-    res.json({
-        ok: true,
-        activeSessions: sessions.size,
-        sessions: sessionList
-    });
+    res.json({ ok: true, activeSessions: sessions.size, sessions: sessionList });
 });
 
-// ============================================
-// ENDPOINT POUR CONNAÎTRE LA RAISON DE DÉCONNEXION
-// ============================================
 app.get('/api/sessions/:sessionId/disconnect-info', (req, res) => {
     const { sessionId } = req.params;
     const session = sessions.get(sessionId);
-    
-    if (!session) {
-        return res.status(404).json({ ok: false, error: 'Session non trouvée' });
-    }
-    
-    // Message explicatif selon la raison
+    if (!session) return res.status(404).json({ ok: false, error: 'Session non trouvée' });
     let message = 'Session active ou raison inconnue';
-    if (session.disconnectReason === 'LOGOUT') {
-        message = 'L\'utilisateur s\'est déconnecté volontairement depuis son téléphone';
-    } else if (session.disconnectReason === 'REMOTE_LOGOUT') {
-        message = 'WhatsApp a déconnecté cet appareil à distance (suppression de l\'appareil)';
-    } else if (session.disconnectReason === 'ACCOUNT_REMOVED') {
-        message = 'Le compte WhatsApp a été supprimé';
-    } else if (session.disconnectReason === 'SESSION_REMOVED') {
-        message = 'La session WhatsApp a été supprimée';
-    } else if (session.disconnectReason) {
-        message = `Déconnecté pour raison: ${session.disconnectReason}`;
-    }
-    
-    res.json({
-        ok: true,
-        sessionId,
-        status: session.status,
-        disconnectReason: session.disconnectReason || null,
-        disconnectedAt: session.disconnectedAt || null,
-        message: message
-    });
+    if (session.disconnectReason === 'LOGOUT') message = 'L\'utilisateur s\'est déconnecté volontairement depuis son téléphone';
+    else if (session.disconnectReason === 'REMOTE_LOGOUT') message = 'WhatsApp a déconnecté cet appareil à distance (suppression de l\'appareil)';
+    else if (session.disconnectReason === 'ACCOUNT_REMOVED') message = 'Le compte WhatsApp a été supprimé';
+    else if (session.disconnectReason === 'SESSION_REMOVED') message = 'La session WhatsApp a été supprimée';
+    else if (session.disconnectReason) message = `Déconnecté pour raison: ${session.disconnectReason}`;
+    res.json({ ok: true, sessionId, status: session.status, disconnectReason: session.disconnectReason || null, disconnectedAt: session.disconnectedAt || null, message });
 });
 
-// ============================================
-// ENDPOINT POUR RÉPARER UNE SESSION (RECONNEXION)
-// ============================================
 app.post('/api/sessions/:sessionId/repair', async (req, res) => {
     const { sessionId } = req.params;
     const session = sessions.get(sessionId);
-    
-    if (!session) {
-        return res.status(404).json({ ok: false, error: 'Session non trouvée' });
-    }
-    
+    if (!session) return res.status(404).json({ ok: false, error: 'Session non trouvée' });
     try {
         console.log(`[${sessionId}] 🔧 Tentative de réparation de la session`);
-        
-        // Vérifier si le client répond
         let state = null;
-        try {
-            state = await session.client.getState();
-            console.log(`[${sessionId}] État actuel: ${state}`);
-        } catch (e) {
-            console.log(`[${sessionId}] Impossible de récupérer l'état: ${e.message}`);
-        }
-        
-        // Si déjà connecté, pas besoin de réparer
-        if (state === 'CONNECTED') {
-            return res.json({ 
-                ok: true, 
-                status: 'already_connected', 
-                state,
-                message: 'Session déjà connectée'
-            });
-        }
-        
-        // Nettoyer l'ancien client
-        try {
-            await session.client.logout();
-            await session.client.destroy();
-        } catch (e) {
-            console.log(`[${sessionId}] Erreur lors du nettoyage: ${e.message}`);
-        }
-        
-        // Créer un nouveau client
+        try { state = await session.client.getState(); console.log(`[${sessionId}] État actuel: ${state}`); } catch (e) { console.log(`[${sessionId}] Impossible de récupérer l'état: ${e.message}`); }
+        if (state === 'CONNECTED') return res.json({ ok: true, status: 'already_connected', state, message: 'Session déjà connectée' });
+        try { await session.client.logout(); await session.client.destroy(); } catch (e) { console.log(`[${sessionId}] Erreur lors du nettoyage: ${e.message}`); }
         console.log(`[${sessionId}] Création d'un nouveau client...`);
         const newClient = await createClient(sessionId);
-        
-        // Mettre à jour la session
         session.client = newClient;
         session.status = 'STARTING';
         session.qr = null;
@@ -714,18 +1280,9 @@ app.post('/api/sessions/:sessionId/repair', async (req, res) => {
         session.lastActivity = Date.now();
         session.disconnectReason = null;
         session.disconnectedAt = null;
-        
         await newClient.initialize();
-        
         console.log(`[${sessionId}] ✅ Réparation initiée, attendez le QR code`);
-        
-        res.json({ 
-            ok: true, 
-            message: 'Session recréée, veuillez scanner le QR code',
-            status: 'repairing',
-            sessionId
-        });
-        
+        res.json({ ok: true, message: 'Session recréée, veuillez scanner le QR code', status: 'repairing', sessionId });
     } catch (error) {
         console.error(`[${sessionId}] ❌ Erreur réparation:`, error.message);
         res.status(500).json({ ok: false, error: error.message });
@@ -733,7 +1290,7 @@ app.post('/api/sessions/:sessionId/repair', async (req, res) => {
 });
 
 // ============================================
-// ENVOI DE MESSAGE TEXTE AVEC VÉRIFICATION PRÉALABLE
+// ENVOI DE MESSAGE TEXTE (déjà existant)
 // ============================================
 
 app.post('/api/messages/send', async (req, res) => {
@@ -960,7 +1517,7 @@ app.post('/api/messages/send-image', async (req, res) => {
 });
 
 // ============================================
-// ENDPOINTS SUIVI
+// ENDPOINTS SUIVI (déjà existants)
 // ============================================
 
 app.get('/api/messages/:messageId/status', (req, res) => {
@@ -1063,12 +1620,10 @@ setInterval(async () => {
                 if (state !== 'CONNECTED') {
                     console.log(`[${sessionId}] ⚠️ État anormal: ${state}, tentative de reconnexion...`);
                     
-                    // Tenter de réinitialiser la connexion
                     try {
                         await session.client.destroy();
                     } catch (e) {}
                     
-                    // Créer un nouveau client
                     const newClient = await createClient(sessionId);
                     session.client = newClient;
                     session.status = 'STARTING';
@@ -1089,7 +1644,7 @@ setInterval(async () => {
             }
         }
     }
-}, 30000); // Toutes les 30 secondes
+}, 30000);
 
 // ============================================
 // DÉMARRAGE
@@ -1103,13 +1658,41 @@ app.listen(PORT, () => {
     console.log(`📍 GET    /api/sessions/:sessionId/phone-number`);
     console.log(`📍 POST   /api/messages/send          (texte avec timeout 60s et retry)`);
     console.log(`📍 POST   /api/messages/send-image    (image depuis URL ou base64)`);
-    console.log(`📍 POST   /api/sessions/:sessionId/ping      (garder session active)`);
-    console.log(`📍 POST   /api/sessions/:sessionId/logout    (déconnexion forcée)`);
-    console.log(`📍 POST   /api/sessions/close-all           (fermer toutes les sessions)`);
-    console.log(`📍 POST   /api/sessions/cleanup-orphans     (nettoyer sessions orphelines)`);
-    console.log(`📍 POST   /api/sessions/:sessionId/repair   (réparation de session)`);
-    console.log(`📍 GET    /api/sessions                    (lister toutes les sessions)`);
-    console.log(`📍 GET    /api/sessions/:sessionId/disconnect-info (raison de déconnexion)`);
+    console.log(`📍 POST   /api/messages/send-video    (vidéo)`);
+    console.log(`📍 POST   /api/messages/send-audio    (audio / message vocal)`);
+    console.log(`📍 POST   /api/messages/send-file     (document)`);
+    console.log(`📍 POST   /api/messages/send-sticker  (sticker)`);
+    console.log(`📍 POST   /api/messages/send-location (localisation)`);
+    console.log(`📍 POST   /api/messages/send-contact  (contact vCard)`);
+    console.log(`📍 POST   /api/messages/:messageId/edit`);
+    console.log(`📍 POST   /api/messages/:messageId/delete`);
+    console.log(`📍 GET    /api/sessions/:sessionId/contacts`);
+    console.log(`📍 GET    /api/sessions/:sessionId/contacts/:contactId`);
+    console.log(`📍 POST   /api/sessions/:sessionId/contacts/:contactId/block`);
+    console.log(`📍 POST   /api/sessions/:sessionId/contacts/:contactId/unblock`);
+    console.log(`📍 POST   /api/sessions/:sessionId/groups`);
+    console.log(`📍 GET    /api/sessions/:sessionId/groups/:groupId`);
+    console.log(`📍 POST   /api/sessions/:sessionId/groups/:groupId/participants`);
+    console.log(`📍 PUT    /api/sessions/:sessionId/groups/:groupId/subject`);
+    console.log(`📍 PUT    /api/sessions/:sessionId/groups/:groupId/description`);
+    console.log(`📍 POST   /api/sessions/:sessionId/chats/:chatId/typing`);
+    console.log(`📍 POST   /api/sessions/:sessionId/chats/:chatId/recording`);
+    console.log(`📍 POST   /api/sessions/:sessionId/chats/:chatId/clear-state`);
+    console.log(`📍 GET    /api/sessions/:sessionId/chats/:chatId/presence`);
+    console.log(`📍 POST   /api/sessions/:sessionId/chats/:chatId/archive`);
+    console.log(`📍 POST   /api/sessions/:sessionId/chats/:chatId/unarchive`);
+    console.log(`📍 POST   /api/sessions/:sessionId/chats/:chatId/pin`);
+    console.log(`📍 POST   /api/sessions/:sessionId/chats/:chatId/unpin`);
+    console.log(`📍 GET    /api/sessions/:sessionId/chats`);
+    console.log(`📍 POST   /api/sessions/:sessionId/ping`);
+    console.log(`📍 POST   /api/sessions/:sessionId/logout`);
+    console.log(`📍 POST   /api/sessions/close-all`);
+    console.log(`📍 POST   /api/sessions/cleanup-orphans`);
+    console.log(`📍 POST   /api/sessions/:sessionId/repair`);
+    console.log(`📍 GET    /api/sessions`);
+    console.log(`📍 GET    /api/sessions/:sessionId/disconnect-info`);
+    console.log(`📍 POST   /api/sessions/:sessionId/webhook`);
+    console.log(`📍 DELETE /api/sessions/:sessionId/webhook`);
     console.log(`📍 GET    /api/messages/:messageId/status`);
     console.log(`📍 GET    /api/health`);
 });
