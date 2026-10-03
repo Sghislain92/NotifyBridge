@@ -14,16 +14,19 @@
 # crash en boucle au démarrage.
 #
 # Ce script tourne encore en ROOT (avant USER notifybridge, qui n'est donc
-# plus fixé dans le Dockerfile), corrige les permissions des dossiers qui
-# peuvent être des volumes montés, puis abandonne les privilèges root pour
+# plus fixé dans le Dockerfile), corrige les permissions du dossier qui
+# peut être un volume monté, puis abandonne les privilèges root pour
 # lancer l'application avec l'utilisateur non-root habituel.
+#
+# Note : /app/data est le SEUL volume à monter sur Railway. Les sessions
+# WhatsApp (.wwebjs_auth) sont désormais stockées dans un sous-dossier de
+# /app/data (voir api-legacy-v3.js, WWEBJS_AUTH_DIR) pour persister sur ce
+# même volume, sans avoir besoin d'un second volume Railway.
 set -e
 
-for d in /app/data /app/.wwebjs_auth; do
-  mkdir -p "$d"
-  chown -R notifybridge:notifybridge "$d" 2>/dev/null || true
-  chmod 0700 "$d" 2>/dev/null || true
-done
+mkdir -p /app/data
+chown -R notifybridge:notifybridge /app/data 2>/dev/null || true
+chmod 0700 /app/data 2>/dev/null || true
 
 # Abandon des privilèges root : tout le reste (Node, Puppeteer/Chrome)
 # s'exécute avec l'utilisateur non privilégié, comme avant.

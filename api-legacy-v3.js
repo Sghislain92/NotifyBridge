@@ -1,3 +1,5 @@
+const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
@@ -38,6 +40,32 @@ app.use(express.json({ limit: process.env.BODY_LIMIT || '5mb' }));
 // ============================================
 const apiKeyStore = new ApiKeyStore();
 const { generatedAdminKey } = bootstrap(apiKeyStore);
+
+// ============================================
+// PERSISTANCE DES SESSIONS WHATSAPP (.wwebjs_auth)
+// ============================================
+// Important : whatsapp-web.js stocke par défaut ses identifiants de session
+// (LocalAuth) dans "./.wwebjs_auth", à la racine de l'appli. Sur Railway, ce
+// dossier n'a PAS de volume monté (seul /app/data en a un) : chaque
+// redéploiement/redémarrage efface donc la session WhatsApp, même si le
+// téléphone affiche encore l'appareil comme "actif" — c'est exactement ce qui
+// causait le QR code bloqué en "en attente du scan" après un redémarrage.
+//
+// Plutôt que de demander un 2e volume Railway (pas toujours simple à monter
+// au bon endroit), on réutilise le volume déjà monté sur /app/data et on y
+// stocke les sessions WhatsApp dans un sous-dossier "wwebjs_auth". Comme ce
+// volume persiste déjà correctement (c'est lui qui garde les clés API), les
+// sessions WhatsApp persisteront désormais de la même façon, sans configuration
+// supplémentaire côté Railway.
+const WWEBJS_AUTH_DIR = path.join(
+  process.env.API_KEYS_DIR ? path.resolve(process.env.API_KEYS_DIR) : path.join(__dirname, 'data'),
+  'wwebjs_auth'
+);
+try {
+  fs.mkdirSync(WWEBJS_AUTH_DIR, { recursive: true, mode: 0o700 });
+} catch (e) {
+  console.error('[wwebjs_auth] Impossible de créer le dossier de sessions WhatsApp :', e.message);
+}
 if (generatedAdminKey) {
   console.log('================================================================');
   console.log(' Aucune clé admin configurée (ADMIN_API_KEY) : une clé a été');
@@ -283,7 +311,7 @@ async function sendWebhook(sessionId, event, data) {
 async function createClient(sessionId) {
   try {
   const client = new Client({
-  authStrategy: new LocalAuth({ clientId: sessionId }),
+  authStrategy: new LocalAuth({ clientId: sessionId, dataPath: WWEBJS_AUTH_DIR }),
   puppeteer: {
   ...puppeteerConfig,
   _puppeteer: puppeteerExtra

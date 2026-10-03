@@ -29,11 +29,12 @@ RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key
 WORKDIR /app
 
 # 3. CRÉATION DES DOSSIERS DE PERSISTANCE (CRUCIAL POUR RAILWAY)
-# .wwebjs_auth stocke les cookies/session WhatsApp (sans cela, WhatsApp détecte
-# un environnement "jetable" et bloque le scan du QR code).
-# data/ stocke le magasin de clés API (hash uniquement) — montez un volume
-# Railway sur /app/data pour que les clés survivent aux redéploiements.
-RUN mkdir -p .wwebjs_auth data \
+# data/ stocke le magasin de clés API (hash uniquement) ET, dans son
+# sous-dossier wwebjs_auth/, les sessions WhatsApp (cookies/credentials —
+# sans cela, WhatsApp détecte un environnement "jetable" et bloque le scan
+# du QR code, ou oublie la connexion au redémarrage). Un seul volume Railway
+# à monter : /app/data — tout le reste persiste automatiquement dedans.
+RUN mkdir -p data/wwebjs_auth \
     && groupadd -r notifybridge && useradd -r -g notifybridge -d /app notifybridge \
     && chown -R notifybridge:notifybridge /app
 
