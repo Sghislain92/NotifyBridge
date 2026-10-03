@@ -1438,7 +1438,10 @@ app.get('/api/sessions', (req, res) => {
             hasInfo: !!(session.client && session.client.info),
             qr: !!session.qr,
             disconnectReason: session.disconnectReason || null,
-            disconnectedAt: session.disconnectedAt || null
+            disconnectedAt: session.disconnectedAt || null,
+            // Exposé uniquement aux clés "admin" : permet à un backend de
+            // supervision (ex: dashboard) d'agréger les sessions par client.
+            ...(isAdmin ? { ownerKeyId: session.ownerKeyId || null, ownerKeyName: session.ownerKeyName || null } : {})
         });
     });
     res.json({ ok: true, activeSessions: sessionList.length, sessions: sessionList });
