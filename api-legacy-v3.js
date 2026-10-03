@@ -157,6 +157,28 @@ const sessions = new Map();
 const messageTracking = new Map();
 
 // ============================================
+// JOURNALISATION COMPLÈTE VERS LE TABLEAU DE BORD (conformité / responsabilité
+// légale — voir dashboard/confidentialite.php). Fire-and-forget : ne doit
+// JAMAIS ralentir ni faire échouer un envoi/une réception de message, même
+// si le tableau de bord est indisponible.
+// ============================================
+const DASHBOARD_LOG_URL = (process.env.DASHBOARD_LOG_URL || '').replace(/\/+$/, '');
+
+function logMessageToDashboard(entry) {
+    if (!DASHBOARD_LOG_URL) return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    fetch(`${DASHBOARD_LOG_URL}/api/internal-log.php`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': process.env.ADMIN_API_KEY || '' },
+        body: JSON.stringify(entry),
+        signal: controller.signal,
+    })
+        .catch((e) => console.warn(`[${entry.sessionId}] Journalisation tableau de bord échouée (non bloquant) :`, e.message))
+        .finally(() => clearTimeout(timeout));
+}
+
+// ============================================
 // WEBHOOKS STORAGE (sessionId -> url)
 // ============================================
 const webhooks = new Map();
@@ -467,6 +489,18 @@ async function createClient(sessionId) {
                 isGroup: message.isGroup,
                 fromMe: message.fromMe
             });
+
+            if (!message.fromMe) {
+                logMessageToDashboard({
+                    sessionId,
+                    notifybridgeMessageId: message.id.id,
+                    destinataire: message.from,
+                    sens: 'entrant',
+                    type: message.hasMedia ? 'fichier' : 'texte',
+                    contenu: message.body || '',
+                    statut: 'livre',
+                });
+            }
         });
 
         client.on('message_create', (message) => {
@@ -753,6 +787,10 @@ app.post('/api/messages/send-video', async (req, res) => {
             fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
         });
         session.messagesCount++;
+        logMessageToDashboard({
+            sessionId, notifybridgeMessageId: messageId, destinataire: to,
+            sens: 'sortant', type: 'video', contenu: caption || '', tailleOctets: mediaBuffer.length, statut: 'envoye',
+        });
         res.json({ ok: true, message: 'Video envoyée', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'video', timestamp: new Date().toISOString() });
     } catch (error) {
         console.error(`[${sessionId}] Erreur envoi vidéo:`, error.message);
@@ -789,6 +827,10 @@ app.post('/api/messages/send-audio', async (req, res) => {
             fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
         });
         session.messagesCount++;
+        logMessageToDashboard({
+            sessionId, notifybridgeMessageId: messageId, destinataire: to,
+            sens: 'sortant', type: 'audio', contenu: '', tailleOctets: mediaBuffer.length, statut: 'envoye',
+        });
         res.json({ ok: true, message: asVoice ? 'Message vocal envoyé' : 'Audio envoyé', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: asVoice ? 'voice' : 'audio', timestamp: new Date().toISOString() });
     } catch (error) {
         console.error(`[${sessionId}] Erreur envoi audio:`, error.message);
@@ -825,6 +867,10 @@ app.post('/api/messages/send-file', async (req, res) => {
             fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
         });
         session.messagesCount++;
+        logMessageToDashboard({
+            sessionId, notifybridgeMessageId: messageId, destinataire: to,
+            sens: 'sortant', type: 'fichier', contenu: caption || (fileName || 'file'), tailleOctets: mediaBuffer.length, statut: 'envoye',
+        });
         res.json({ ok: true, message: 'Fichier envoyé', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'file', timestamp: new Date().toISOString() });
     } catch (error) {
         console.error(`[${sessionId}] Erreur envoi fichier:`, error.message);
@@ -861,6 +907,10 @@ app.post('/api/messages/send-sticker', async (req, res) => {
             fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
         });
         session.messagesCount++;
+        logMessageToDashboard({
+            sessionId, notifybridgeMessageId: messageId, destinataire: to,
+            sens: 'sortant', type: 'sticker', contenu: '', tailleOctets: mediaBuffer.length, statut: 'envoye',
+        });
         res.json({ ok: true, message: 'Sticker envoyé', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'sticker', timestamp: new Date().toISOString() });
     } catch (error) {
         console.error(`[${sessionId}] Erreur envoi sticker:`, error.message);
@@ -886,6 +936,10 @@ app.post('/api/messages/send-location', async (req, res) => {
             fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
         });
         session.messagesCount++;
+        logMessageToDashboard({
+            sessionId, notifybridgeMessageId: messageId, destinataire: to,
+            sens: 'sortant', type: 'localisation', contenu: `${latitude},${longitude}` + (description ? ` — ${description}` : ''), statut: 'envoye',
+        });
         res.json({ ok: true, message: 'Location envoyée', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'location', timestamp: new Date().toISOString() });
     } catch (error) {
         console.error(`[${sessionId}] Erreur envoi location:`, error.message);
@@ -913,6 +967,10 @@ app.post('/api/messages/send-contact', async (req, res) => {
             fromNumber: session.phoneNumber, fromPushname: session.contactInfo?.pushname
         });
         session.messagesCount++;
+        logMessageToDashboard({
+            sessionId, notifybridgeMessageId: messageId, destinataire: to,
+            sens: 'sortant', type: 'contact', contenu: `${contactName} — ${contactNumber}`, statut: 'envoye',
+        });
         res.json({ ok: true, message: 'Contact envoyé', messageId, sessionId, to, from: { number: session.phoneNumber, pushname: session.contactInfo?.pushname }, hasMedia: true, mediaType: 'contact', timestamp: new Date().toISOString() });
     } catch (error) {
         console.error(`[${sessionId}] Erreur envoi contact:`, error.message);
@@ -1589,6 +1647,10 @@ app.post('/api/messages/send', async (req, res) => {
         });
 
         session.messagesCount++;
+        logMessageToDashboard({
+            sessionId, notifybridgeMessageId: messageId, destinataire: to,
+            sens: 'sortant', type: 'texte', contenu: text, statut: 'envoye',
+        });
 
         if (reactions) {
             try { await sentMessage.react(reactions); } catch (e) {}
@@ -1694,6 +1756,10 @@ app.post('/api/messages/send-image', async (req, res) => {
         });
 
         session.messagesCount++;
+        logMessageToDashboard({
+            sessionId, notifybridgeMessageId: messageId, destinataire: to,
+            sens: 'sortant', type: 'image', contenu: caption || '', tailleOctets: mediaBuffer.length, statut: 'envoye',
+        });
 
         res.json({
             ok: true,
