@@ -53,13 +53,20 @@ ENV API_KEYS_DIR=/app/data
 
 EXPOSE 3000
 
-# 7. Le conteneur ne tourne plus en root : réduit l'impact d'une éventuelle
-# exécution de code arbitraire côté Chrome/Puppeteer.
-USER notifybridge
+# 7. Point d'entrée : corrige les permissions des volumes montés (Railway
+# monte un volume en root:root, ce qui écrase le chown fait plus haut),
+# PUIS abandonne les privilèges root pour lancer Node avec l'utilisateur
+# non privilégié "notifybridge" — pas de USER fixe ici, c'est le script
+# lui-même qui fait le `su` après avoir corrigé les droits (voir
+# docker-entrypoint.sh pour le détail du problème et de la solution).
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod 755 /app/docker-entrypoint.sh
 
 # 8. Healthcheck: /api/health est public (pas de clé API requise)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD node -e "fetch('http://localhost:' + (process.env.PORT || 8080) + '/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-# 9. Lancement de l'API
-CMD ["npm", "start"]
+# 9. Lancement de l'API (voir docker-entrypoint.sh : démarre en root juste
+# le temps de corriger les permissions, puis bascule sur l'utilisateur non
+# privilégié "notifybridge" avant de lancer Node).
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
