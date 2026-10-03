@@ -2,7 +2,7 @@
 
 NotifyBridge est une plateforme SaaS et une API dédiée à la gestion, l'automatisation et la supervision des communications WhatsApp pour les entreprises, développeurs et plateformes digitales. Elle permet de connecter des comptes WhatsApp via QR code, d'envoyer des notifications, d'automatiser des scénarios métier.
 
-## 🔒 Sécurité — authentification obligatoire
+## Sécurité — authentification obligatoire
 
 **Depuis cette version, toutes les routes de l'API (sauf `/api/health`) exigent une clé API valide.** Sans elle, l'API répond `401 Unauthorized`. Voir [`SECURITY.md`](./SECURITY.md) pour l'audit complet des failles trouvées et corrigées.
 
@@ -23,9 +23,9 @@ Authorization: Bearer nbk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 Au premier lancement, si aucune clé admin n'est configurée, le serveur **génère une clé admin aléatoire et l'affiche une seule fois dans les logs de démarrage** :
 
 ```
-🔑 Aucune clé admin configurée (ADMIN_API_KEY) : une clé a été
-   générée automatiquement. Notez-la, elle ne sera plus affichée :
-   nbk_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+ Aucune clé admin configurée (ADMIN_API_KEY) : une clé a été
+  générée automatiquement. Notez-la, elle ne sera plus affichée :
+  nbk_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 ```
 
 En production (Railway), définissez plutôt la variable d'environnement `ADMIN_API_KEY` avec une valeur forte et stable, générée par exemple avec :
@@ -48,7 +48,7 @@ node -e "console.log('nbk_' + require('crypto').randomBytes(32).toString('base64
 ## Démarrage
 
 ```bash
-cp .env.example .env   # renseignez au moins ADMIN_API_KEY
+cp .env.example .env # renseignez au moins ADMIN_API_KEY
 npm install
 npm start
 ```

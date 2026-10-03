@@ -88,10 +88,10 @@ L'API déployée sur `notifybridge-production.up.railway.app` n'appliquait **auc
 
 - Démarrage du serveur et vérification des logs (aucune erreur, génération de la clé admin).
 - `GET /api/health` accessible sans clé (200).
-- Toute autre route sans clé → `401`. Avec clé invalide → `401`. Avec clé valide → `200`.
+- Toute autre route sans clé `401`. Avec clé invalide `401`. Avec clé valide `200`.
 - Création de clé standard via `/api/admin/keys`, refus `403` de cette même clé sur les routes `/api/admin/keys`.
-- `sessionId` contenant des caractères de traversée (`..%2f..`) ou invalides → `400` avant tout accès disque.
+- `sessionId` contenant des caractères de traversée (`..%2f..`) ou invalides `400` avant tout accès disque.
 - Garde SSRF testé unitairement : bloque `169.254.169.254`, `127.0.0.1`, `localhost`, `10.x`, `192.168.x` ; laisse passer des URLs publiques légitimes.
-- Révocation d'une clé → usage immédiatement refusé (`401`).
+- Révocation d'une clé usage immédiatement refusé (`401`).
 - `Authorization: Bearer` et `x-api-key` tous deux fonctionnels.
-- Rate limiting vérifié isolément (3ᵉ requête sur une limite de 2 → `429`).
+- Rate limiting vérifié isolément (3ᵉ requête sur une limite de 2 `429`).
