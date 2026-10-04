@@ -1,98 +1,96 @@
-# NotifyBridge
+# NotifyBridge API
 
-NotifyBridge est une plateforme SaaS et une API dédiée à la gestion, l'automatisation et la supervision des communications WhatsApp pour les entreprises, développeurs et plateformes digitales. Elle permet de connecter des comptes WhatsApp via QR code, d'envoyer des notifications, d'automatiser des scénarios métier.
+API WhatsApp multi-sessions destinée aux applications professionnelles, aux équipes et aux intégrations métier.
 
-## Sécurité — authentification obligatoire
+## Authentification et portée des clés
 
-**Depuis cette version, toutes les routes de l'API (sauf `/api/health`) exigent une clé API valide.** Sans elle, l'API répond `401 Unauthorized`. Voir [`SECURITY.md`](./SECURITY.md) pour l'audit complet des failles trouvées et corrigées.
+Toutes les routes, sauf `GET /api/health`, exigent une clé valide dans l’en-tête `x-api-key` (ou `Authorization: Bearer …`).
 
-### Envoyer la clé
+- **`standard`** est la portée normale d’une application cliente. Elle n’est pas réservée à la démo : elle permet à l’application propriétaire de piloter ses propres sessions, d’envoyer des messages et d’utiliser les routes de contacts, groupes et chats autorisées.
+- **`admin`** est réservée à l’exploitation de la plateforme : gestion des clés et accès inter-tenant.
+- Le dashboard crée les clés standard via la clé admin et associe explicitement la session à l’identifiant de sa clé. Le propriétaire est persisté dans `API_KEYS_DIR/session-owners.json`.
+- Une clé standard ne peut jamais agir sur les sessions d’un autre compte ni sur une session historique sans propriétaire qui ne lui a pas été explicitement attribuée.
 
-Deux en-têtes sont acceptés (au choix) :
+Gestion des clés (admin uniquement) :
 
-```
-x-api-key: nbk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-ou
-```
-Authorization: Bearer nbk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-### Premier démarrage — obtenir une clé admin
-
-Au premier lancement, si aucune clé admin n'est configurée, le serveur **génère une clé admin aléatoire et l'affiche une seule fois dans les logs de démarrage** :
-
-```
- Aucune clé admin configurée (ADMIN_API_KEY) : une clé a été
-  générée automatiquement. Notez-la, elle ne sera plus affichée :
-  nbk_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-```
-
-En production (Railway), définissez plutôt la variable d'environnement `ADMIN_API_KEY` avec une valeur forte et stable, générée par exemple avec :
-
-```bash
-node -e "console.log('nbk_' + require('crypto').randomBytes(32).toString('base64url'))"
-```
-
-### Gérer les clés (portée admin)
-
-| Méthode | Route | Description |
+| Méthode | Route | Usage |
 |---|---|---|
-| `POST` | `/api/admin/keys` | Crée une clé (`{ "name": "client-x", "scope": "standard" \| "admin" }`). La clé en clair n'est renvoyée **qu'une fois**, dans la réponse. |
-| `GET` | `/api/admin/keys` | Liste les clés (métadonnées uniquement, jamais la clé en clair). |
-| `DELETE` | `/api/admin/keys/:id` | Révoque une clé immédiatement. |
+| `POST` | `/api/admin/keys` | Créer une clé; le secret clair n’est renvoyé qu’une fois. |
+| `GET` | `/api/admin/keys` | Lister les métadonnées (jamais le secret). |
+| `DELETE` | `/api/admin/keys/:id` | Révoquer une clé. |
+| `POST` | `/api/admin/sessions/:sessionId/owner` | Associer durablement une session à une clé standard. |
+| `POST` | `/api/admin/keys/:id/quota` | Définir ou retirer un plafond d’envois pour une clé standard. |
 
-- **`admin`** : gère les clés, agit sur toutes les sessions WhatsApp de tous les clients (utile pour l'opérateur de la plateforme).
-- **`standard`** : ne peut créer/lire/piloter que les sessions WhatsApp qu'elle a elle-même créées — isolation multi-tenant : une clé cliente ne peut jamais lire ou piloter les sessions WhatsApp d'un autre client, même en devinant leur `sessionId`.
+Le catalogue exhaustif, extrait des routes réelles du serveur, est publié sur la [référence API NotifyBridge](https://notify-bridge.com/ap.php#catalogue-complet-api).
 
-## Démarrage
+## Envoyer un message texte
+
+Le champ requis est **`text`**, et non `message` :
 
 ```bash
-cp .env.example .env # renseignez au moins ADMIN_API_KEY
+curl -X POST https://notifybridge-production.up.railway.app/api/messages/send \
+  -H 'x-api-key: VOTRE_CLE_STANDARD' \
+  -H 'Content-Type: application/json' \
+  -d '{"sessionId":"app-UUID","to":"22890000000","text":"Votre commande est confirmée."}'
+```
+
+Le résultat contient `ok`, `messageId`, `sessionId`, `to`, `timestamp` et les informations d’expéditeur. Tous les endpoints d’envoi texte et médias passent par le même contrôle de quota lorsqu’un plafond a été défini pour la clé.
+
+## Forfait de bienvenue
+
+Le dashboard peut poser `maxOutboundMessages: 15` sur la clé unique remise à un nouveau compte après confirmation de son adresse. Le compteur est stocké avec la clé dans le magasin persistant; les requêtes concurrentes réservent leur place avant d’appeler WhatsApp, et une réservation est rendue si l’envoi échoue. Le seizième envoi est refusé avec HTTP `429`, code `WELCOME_QUOTA_REACHED`. Un abonnement payant utilise une nouvelle clé sans ce plafond.
+
+Ce compteur s’applique aux envois **effectués via l’API**. Il ne peut pas empêcher une personne d’envoyer manuellement depuis son application WhatsApp liée.
+
+## États de connexion WhatsApp
+
+Les états typiques sont `STARTING`, `SCAN_QR`, `AUTHENTICATED`, `WORKING`, `DISCONNECTED` ou `AUTH_FAILURE`. `AUTHENTICATED` signifie que le téléphone a accepté le QR; WhatsApp Web peut encore prendre plusieurs minutes pour finaliser l’initialisation avant `WORKING`. Gardez le polling de statut actif et n’affichez plus le QR comme « en attente de scan » dans cette phase.
+
+## Journalisation et boîte de réception du dashboard
+
+Pour alimenter les conversations du dashboard avec les messages envoyés par API et leurs réponses, configurer les variables d’environnement du service API :
+
+- `DASHBOARD_LOG_URL=https://notify-bridge.com/dashboard` (sans slash final; le service ajoute `/api/internal-log.php`).
+- `ADMIN_API_KEY` doit être la même valeur que `NOTIFYBRIDGE_ADMIN_KEY` dans le fichier privé du dashboard. Le callback l’envoie dans `X-Internal-Secret`; elle ne doit jamais être mise dans le navigateur.
+- `API_KEYS_DIR` doit désigner un volume persistant et accessible en écriture, afin que clés, quotas de bienvenue et propriétaires de sessions survivent aux redémarrages.
+
+Le journal est best-effort et ne bloque pas les échanges WhatsApp. Les événements sortants ouvrent les conversations; les messages entrants ne sont ajoutés qu’à un fil déjà initié par un envoi. Les préférences de rétention/purge sont gérées dans la base du dashboard.
+
+## Configuration et déploiement
+
+Ne créez pas de fichier `.env` pour ce déploiement. Saisissez les variables directement dans l’environnement du service Railway (ou exportez-les dans le shell de développement) :
+
+```bash
+export ADMIN_API_KEY='une-cle-admin-forte-et-stable'
+export API_KEYS_DIR='/app/data'
+export DASHBOARD_LOG_URL='https://notify-bridge.com/dashboard'
 npm install
 npm start
 ```
 
-Variables d'environnement principales (voir `.env.example` pour la liste complète) :
+Sur Railway : conserver un volume monté pour `/app/data` et `.wwebjs_auth`, définir les variables dans **Service → Variables**, puis déployer les fichiers du dépôt. Après une rotation de `ADMIN_API_KEY`, mettre également à jour le fichier privé `.config/notifybridge-dashboard.php` du dashboard et redémarrer les services concernés.
+
+## Routes principales
+
+Toutes les routes listées ci-dessous sont protégées par une clé, sauf `GET /api/health` :
+
+- Sessions : démarrer, lister, lire le QR/statut/infos/numéro, réparer, ping, logout/suppression, webhooks et nettoyage des orphelines.
+- Messages : texte, image, vidéo, audio, fichier, sticker, localisation et contact; statut, historique, édition et suppression.
+- Conversations : chats, présence/typing/recording, épinglage, archivage et nettoyage d’état.
+- Contacts : liste, profil détaillé, blocage/déblocage.
+- Groupes : création, profil, participants, sujet et description.
+- Administration : clés, propriétaires de session, quota de clé, statistiques globales.
+
+## Variables d’environnement
 
 | Variable | Rôle | Défaut |
 |---|---|---|
-| `ADMIN_API_KEY` | Clé admin stable | (générée aléatoirement si absente) |
-| `API_KEYS` | Clés "standard" créées automatiquement au démarrage (séparées par virgules) | — |
-| `API_KEYS_DIR` | Dossier de persistance du magasin de clés (montez un volume Railway ici) | `./data` |
-| `ALLOWED_ORIGINS` | Origines CORS autorisées, séparées par virgules | toutes (usage serveur-à-serveur) |
-| `MAX_SESSIONS_TOTAL` / `MAX_SESSIONS_PER_KEY` | Plafonds anti-épuisement de ressources | `50` / `5` |
-| `RATE_LIMIT_MAX` / `START_RATE_LIMIT_MAX` | Limites de requêtes par clé (par minute / par 10 min pour la création de session) | `120` / `5` |
+| `ADMIN_API_KEY` | Clé admin stable et secrète | génération unique au démarrage si absente |
+| `API_KEYS` | Clés standard de bootstrap, séparées par virgules | — |
+| `API_KEYS_DIR` | Dossier persistant pour le magasin de clés et les propriétaires | `./data` |
+| `DASHBOARD_LOG_URL` | URL de base du dashboard recevant les logs/messages | désactivé |
+| `ALLOWED_ORIGINS` | Origines CORS autorisées | configuration serveur |
+| `MAX_SESSIONS_TOTAL` / `MAX_SESSIONS_PER_KEY` | Limites de ressources globales/par clé | `50` / `5` |
+| `RATE_LIMIT_MAX` / `START_RATE_LIMIT_MAX` | Limites de requêtes générales/de démarrage | `120` / `5` |
 
-## Déploiement Railway
-
-1. Ajoutez un **volume** monté sur `/app/data` (persistance des clés API) et `/app/.wwebjs_auth` (persistance des sessions WhatsApp).
-2. Définissez `ADMIN_API_KEY` dans les variables du service.
-3. Déployez — `Dockerfile` installe Chrome et lance l'API sur `$PORT`.
-4. Créez vos clés clients via `POST /api/admin/keys` (voir plus haut), puis distribuez-les à vos clients pour qu'ils appellent l'API avec leur propre clé.
-
-## Principaux endpoints
-
-Toutes les routes ci-dessous nécessitent une clé API (sauf `/api/health`).
-
-- `POST /api/sessions/:sessionId/start` — démarre une session WhatsApp (QR code)
-- `GET /api/sessions/:sessionId/qr` / `/status` / `/info`
-- `POST /api/messages/send`, `/send-image`, `/send-video`, `/send-audio`, `/send-file`, `/send-sticker`, `/send-location`, `/send-contact`
-- `GET /api/sessions` — liste **vos** sessions (toutes les sessions si clé `admin`)
-- `POST /api/sessions/close-all` / `cleanup-orphans` — agissent sur **vos** sessions (toutes si clé `admin`)
-- `GET /api/health` — endpoint public, sans authentification
-
-## Sécurité — ce qui est appliqué
-
-- Authentification obligatoire par clé API sur toute l'API (sauf `/api/health`).
-- Isolation multi-tenant : une clé ne voit/pilote que les sessions qu'elle a créées.
-- Protection SSRF sur toutes les URLs fournies par l'appelant (webhook, médias) : schéma http/https uniquement, résolution DNS vérifiée contre les plages privées/loopback/link-local/metadata cloud.
-- Validation stricte du `sessionId` (empêche la traversée de répertoire dans le stockage de session WhatsApp).
-- Limites anti-épuisement de ressources (nombre de sessions Chrome simultanées, global et par clé).
-- Rate limiting par IP (avant authentification) et par clé API (après authentification), avec une limite spécifique et plus stricte sur la création de session.
-- En-têtes de sécurité HTTP via `helmet`.
-- CORS restreignable par variable d'environnement.
-- Journaux applicatifs sans contenu sensible en clair (numéros, texte des messages) par défaut.
-- Conteneur Docker exécuté avec un utilisateur non-root.
-
-Détails complets, failles trouvées avant correctif, et limites connues : voir [`SECURITY.md`](./SECURITY.md).
+Pour les limites de sécurité, procédures et risques résiduels, voir [`SECURITY.md`](./SECURITY.md).

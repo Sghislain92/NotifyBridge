@@ -37,12 +37,15 @@ L'API déployée sur `notifybridge-production.up.railway.app` n'appliquait **auc
 - Toute route est désormais protégée, sauf `GET /api/health` (endpoint de supervision, sans donnée sensible).
 - Clé envoyée via `x-api-key` ou `Authorization: Bearer`.
 - Les clés en clair ne sont **jamais stockées** : seul un hash SHA-256 est conservé (`data/api-keys.json`), comparé en temps constant (`crypto.timingSafeEqual`).
-- Deux portées : `admin` (gestion des clés + accès à toutes les sessions) et `standard` (limité à ses propres sessions).
+- Deux portées : `admin` (gestion des clés + accès à toutes les sessions) et `standard` (limité aux sessions explicitement attribuées à sa clé; la portée standard sert aux applications clientes, pas seulement à la démo).
 - Bootstrap : `ADMIN_API_KEY` en variable d'environnement (recommandé), ou génération automatique affichée une seule fois au démarrage si absente.
 - Gestion des clés via `POST/GET /api/admin/keys` et `DELETE /api/admin/keys/:id` (réservé aux clés `admin`).
+- `GET /api/stats` est réservé aux clés `admin` : cette route expose les statistiques et les sessions globales de la plateforme.
+- `POST /api/admin/sessions/:sessionId/owner` attribue une session à une clé standard, après vérification de l’existence de la clé; le mapping est persistant sous `API_KEYS_DIR`.
+- `POST /api/admin/keys/:id/quota` (admin uniquement) configure un quota sortant; seuls le plafond et le compteur sont exposés dans l’inventaire des clés, jamais les secrets.
 
 ### 3.2 Isolation multi-tenant
-- Chaque session WhatsApp est associée à la clé API qui l'a créée (`session.ownerKeyId`).
+- Chaque session WhatsApp est associée à la clé API qui l'a créée ou que l'administrateur lui a explicitement attribuée (`session.ownerKeyId`); les associations survivent aux redémarrages.
 - `app.param('sessionId', ...)` vérifie automatiquement l'appartenance sur toutes les routes utilisant `:sessionId` dans l'URL ; une clé `standard` reçoit `403` si elle tente d'agir sur la session d'un autre client.
 - Les routes recevant `sessionId` dans le corps de la requête (`/api/messages/send*`) utilisent le même contrôle via `resolveOwnedSession()`.
 - `GET /api/sessions`, `/close-all`, `/cleanup-orphans` filtrent désormais par propriétaire pour une clé `standard` (une clé `admin` continue de voir/agir sur tout).
@@ -60,18 +63,23 @@ L'API déployée sur `notifybridge-production.up.railway.app` n'appliquait **auc
 - `MAX_SESSIONS_TOTAL` (défaut 50) et `MAX_SESSIONS_PER_KEY` (défaut 5), vérifiés avant toute création de session Chrome/Puppeteer.
 - Rate limiting dédié et plus strict sur `POST /api/sessions/:sessionId/start` (`START_RATE_LIMIT_MAX`, défaut 5 / 10 min / clé).
 
-### 3.6 Rate limiting général (`express-rate-limit`)
+### 3.6 Quota d’envoi du forfait de bienvenue
+- Le quota est posé par une route d’administration sur une clé standard précise, puis stocké avec le magasin persistant des clés.
+- Un middleware commun protège les huit endpoints d’envoi texte/médias. Il réserve synchroniquement une place avant tout appel WhatsApp, empêche le dépassement concurrent et libère la réservation si l’envoi échoue. Après 15 succès, l’API répond `429` avec `WELCOME_QUOTA_REACHED`.
+- Limite explicite : la protection s’applique aux appels API; elle ne peut pas empêcher un envoi manuel depuis un téléphone/appareil WhatsApp lié.
+
+### 3.7 Rate limiting général (`express-rate-limit`)
 - Un limiteur par IP, actif **avant** l'authentification (`IP_RATE_LIMIT_MAX`, défaut 300 / 5 min), pour ralentir le bruteforce de clés API.
 - Un limiteur par clé API, après authentification (`RATE_LIMIT_MAX`, défaut 120 / min).
 
-### 3.7 CORS restreignable, en-têtes de sécurité HTTP
+### 3.8 CORS restreignable, en-têtes de sécurité HTTP
 - `helmet()` appliqué globalement.
 - CORS configurable via `ALLOWED_ORIGINS` (liste blanche), `*` par défaut pour compatibilité (usage serveur-à-serveur ; rappel documenté que la clé API ne doit jamais être exposée côté navigateur).
 
-### 3.8 Journalisation
+### 3.9 Journalisation
 - Le corps de requête complet n'est plus journalisé par défaut. Un mode `DEBUG_LOG_BODIES=true` existe pour le débogage local, avec les champs sensibles tronqués/masqués (`lib/security.js#redactForLog`).
 
-### 3.9 Conteneur Docker
+### 3.10 Conteneur Docker
 - Utilisateur non-root dédié (`notifybridge`).
 - `HEALTHCHECK` basé sur `/api/health`.
 - Volume recommandé sur `/app/data` (clés API) et `/app/.wwebjs_auth` (sessions WhatsApp) pour la persistance entre redéploiements Railway.
@@ -79,7 +87,7 @@ L'API déployée sur `notifybridge-production.up.railway.app` n'appliquait **auc
 ## 4. Ce qui reste de la responsabilité de l'opérateur
 
 1. **Rotation immédiate** : la clé codée en dur dans l'historique Git (`old/api-legacy.js`) est publique et doit être considérée comme compromise — elle n'est plus utilisée par le code actif, mais si elle a été réutilisée ailleurs (autre service, autre API), changez-la là aussi.
-2. **Définir `ADMIN_API_KEY`** en variable d'environnement Railway avant la mise en production (sinon une clé est régénérée à chaque redémarrage sans volume persistant).
+2. **Définir `ADMIN_API_KEY`** dans les variables Railway avant la mise en production (aucun fichier `.env` n’est nécessaire; sans volume persistant, un démarrage sans variable peut générer une nouvelle clé admin).
 3. **Monter un volume persistant** sur `/app/data` pour ne pas perdre les clés clients à chaque redéploiement.
 4. Envisager, si le modèle de menace l'exige, l'épinglage DNS pour fermer complètement le résidu de risque SSRF (rebinding), et un store de rate-limit partagé (Redis) si l'API est un jour répartie sur plusieurs instances.
 5. Envisager de purger l'historique Git de l'ancienne clé (`git filter-repo`/BFG) — cela ne l'invalide pas rétroactivement sur le web (GitHub garde des caches), mais réduit sa visibilité dans le futur.

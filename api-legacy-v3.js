@@ -120,6 +120,55 @@ const keyLimiter = rateLimit({
 });
 app.use(keyLimiter);
 
+// Limite welcome : comptage persistant et réservation synchrone par clé. La
+// réservation est annulée sur toute réponse d'échec; elle est conservée après
+// un envoi confirmé. Les clés payantes non marquées n'ont aucun plafond ici.
+function welcomeQuotaGuard(req, res, next) {
+  const apiKey = req.apiKey;
+  if (!apiKey || apiKey.scope !== 'standard') return next();
+  const reservation = apiKeyStore.reserveOutboundMessage(apiKey.id);
+  if (!reservation.allowed) {
+    return res.status(429).json({
+      ok: false,
+      error: reservation.storageError
+        ? 'Envoi suspendu : impossible de persister le quota du forfait de bienvenue.'
+        : `Limite de ${reservation.limit} messages sortants du forfait de bienvenue atteinte. Abonnez-vous pour continuer.`,
+      code: reservation.storageError ? 'WELCOME_QUOTA_STORAGE_ERROR' : 'WELCOME_QUOTA_REACHED',
+      limit: reservation.limit,
+      remaining: reservation.remaining,
+    });
+  }
+  if (!reservation.reserved) return next();
+  let settled = false;
+  const originalJson = res.json.bind(res);
+  res.json = (payload) => {
+    if (!settled) {
+      settled = true;
+      if (res.statusCode >= 400 || payload?.ok !== true) apiKeyStore.releaseOutboundMessage(apiKey.id);
+    }
+    return originalJson(payload);
+  };
+  res.once('close', () => {
+    if (!settled) {
+      settled = true;
+      apiKeyStore.releaseOutboundMessage(apiKey.id);
+    }
+  });
+  next();
+}
+
+// Configure le quota exclusivement depuis l'admin du dashboard.
+app.post('/api/admin/keys/:id/quota', requireAdmin, (req, res) => {
+  const raw = req.body?.maxOutboundMessages;
+  const limit = raw === null ? null : Number(raw);
+  if (limit !== null && (!Number.isInteger(limit) || limit < 0 || limit > 100000)) {
+    return res.status(400).json({ ok: false, error: 'maxOutboundMessages doit être null ou un entier entre 0 et 100000.' });
+  }
+  const quota = apiKeyStore.setOutboundLimit(req.params.id, limit);
+  if (!quota) return res.status(404).json({ ok: false, error: 'Clé standard active introuvable ou stockage indisponible.' });
+  return res.json({ ok: true, quota });
+});
+
 const startLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   limit: parseInt(process.env.START_RATE_LIMIT_MAX || '5', 10),
@@ -183,6 +232,28 @@ const puppeteerConfig = {
 // ============================================
 const sessions = new Map();
 const messageTracking = new Map();
+// Propriétaire logique de chaque session; la connexion WhatsApp est persistée
+// sur disque et ce mapping doit donc survivre aux redémarrages Railway.
+const SESSION_OWNER_DIR = process.env.API_KEYS_DIR
+  ? path.resolve(process.env.API_KEYS_DIR)
+  : path.join(__dirname, 'data');
+const SESSION_OWNER_FILE = path.join(SESSION_OWNER_DIR, 'session-owners.json');
+let sessionOwners = {};
+try {
+  if (fs.existsSync(SESSION_OWNER_FILE)) {
+    const rawOwners = JSON.parse(fs.readFileSync(SESSION_OWNER_FILE, 'utf8'));
+    if (rawOwners && typeof rawOwners === 'object' && !Array.isArray(rawOwners)) sessionOwners = rawOwners;
+  }
+} catch (e) {
+  console.error('[sessionOwners] Impossible de lire le mapping de propriétaires :', e.message);
+}
+
+function persistSessionOwners() {
+  fs.mkdirSync(SESSION_OWNER_DIR, { recursive: true, mode: 0o700 });
+  const temporaryFile = `${SESSION_OWNER_FILE}.tmp`;
+  fs.writeFileSync(temporaryFile, JSON.stringify(sessionOwners, null, 2), { mode: 0o600 });
+  fs.renameSync(temporaryFile, SESSION_OWNER_FILE);
+}
 
 // ============================================
 // JOURNALISATION COMPLÈTE VERS LE TABLEAU DE BORD (conformité / responsabilité
@@ -242,7 +313,7 @@ function resolveOwnedSession(req, res, sessionId) {
   res.status(404).json({ ok: false, error: 'Session non trouvée' });
   return null;
   }
-  if (req.apiKey.scope !== 'admin' && session.ownerKeyId && session.ownerKeyId !== req.apiKey.id) {
+  if (req.apiKey.scope !== 'admin' && session.ownerKeyId !== req.apiKey.id) {
   res.status(403).json({ ok: false, error: "Cette session appartient à une autre clé API." });
   return null;
   }
@@ -257,7 +328,7 @@ app.param('sessionId', (req, res, next, sessionId) => {
   return res.status(400).json({ ok: false, error: "sessionId invalide : uniquement lettres, chiffres, '-' et '_', 64 caractères max" });
   }
   const session = sessions.get(sessionId);
-  if (session && req.apiKey && req.apiKey.scope !== 'admin' && session.ownerKeyId && session.ownerKeyId !== req.apiKey.id) {
+  if (session && req.apiKey && req.apiKey.scope !== 'admin' && session.ownerKeyId !== req.apiKey.id) {
   return res.status(403).json({ ok: false, error: "Cette session appartient à une autre clé API." });
   }
   next();
@@ -288,6 +359,33 @@ app.delete('/api/admin/keys/:id', requireAdmin, (req, res) => {
   const removed = apiKeyStore.revokeKey(req.params.id);
   if (!removed) return res.status(404).json({ ok: false, error: 'Clé introuvable' });
   res.json({ ok: true, message: 'Clé révoquée' });
+});
+
+// Le dashboard crée une session avec la clé de service admin (le secret client
+// n'est jamais stocké dans son serveur), puis transfère l'isolation à la clé
+// standard propre à l'application. Seule une clé admin active peut effectuer
+// cette opération, et les métadonnées persistent lors des redémarrages.
+app.post('/api/admin/sessions/:sessionId/owner', requireAdmin, (req, res) => {
+  const { sessionId } = req.params;
+  const ownerKeyId = typeof req.body?.ownerKeyId === 'string' ? req.body.ownerKeyId : '';
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ ok: false, error: 'Session non trouvée' });
+  const owner = apiKeyStore.getActiveKeyMetadata(ownerKeyId);
+  if (!owner || owner.scope !== 'standard') {
+    return res.status(400).json({ ok: false, error: 'Une clé standard active est requise comme propriétaire.' });
+  }
+  const ancienneValeur = sessionOwners[sessionId];
+  sessionOwners[sessionId] = { ownerKeyId: owner.id, ownerKeyName: owner.name };
+  try {
+    persistSessionOwners();
+  } catch (error) {
+    if (ancienneValeur) sessionOwners[sessionId] = ancienneValeur;
+    else delete sessionOwners[sessionId];
+    return res.status(500).json({ ok: false, error: 'Impossible de persister le propriétaire de session.' });
+  }
+  session.ownerKeyId = owner.id;
+  session.ownerKeyName = owner.name;
+  res.json({ ok: true, sessionId, ownerKeyId: owner.id, ownerKeyName: owner.name });
 });
 
 // Helper function to send webhook events
@@ -538,6 +636,17 @@ async function createClient(sessionId) {
   client.on('message_create', (message) => {
   // Similar to message, but includes messages sent by the client itself
   sendWebhook(sessionId, 'message_create', { id: message.id.id, from: message.from, body: message.body });
+  if (message.fromMe) {
+  logMessageToDashboard({
+  sessionId,
+  notifybridgeMessageId: message.id.id,
+  destinataire: message.to,
+  sens: 'sortant',
+  type: message.hasMedia ? 'fichier' : 'texte',
+  contenu: message.body || '',
+  statut: 'envoye',
+  });
+  }
   });
 
   client.on('message_revoke_everyone', (after, before) => {
@@ -644,6 +753,24 @@ app.post('/api/sessions/:sessionId/start', startLimiter, async (req, res) => {
   sessions.delete(sessionId);
   }
 
+  const ownerWasRecorded = Object.prototype.hasOwnProperty.call(sessionOwners, sessionId);
+  let owner = ownerWasRecorded
+    ? apiKeyStore.getActiveKeyMetadata(sessionOwners[sessionId].ownerKeyId)
+    : null;
+  if (ownerWasRecorded && !owner && req.apiKey.scope !== 'admin') {
+    return res.status(403).json({ ok: false, error: 'Le propriétaire précédent de cette session est révoqué; un administrateur doit réattribuer la session.' });
+  }
+  if (owner && req.apiKey.scope !== 'admin' && owner.id !== req.apiKey.id) {
+    return res.status(403).json({ ok: false, error: 'Cette session appartient à une autre clé API.' });
+  }
+  if (!owner) owner = { id: req.apiKey.id, name: req.apiKey.name };
+  sessionOwners[sessionId] = { ownerKeyId: owner.id, ownerKeyName: owner.name };
+  try {
+    persistSessionOwners();
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: 'Impossible de persister le propriétaire de session.' });
+  }
+
   if (sessions.size >= MAX_SESSIONS_TOTAL) {
   return res.status(429).json({ ok: false, error: `Limite globale de sessions atteinte (${MAX_SESSIONS_TOTAL}).` });
   }
@@ -665,8 +792,8 @@ app.post('/api/sessions/:sessionId/start', startLimiter, async (req, res) => {
   contactInfo: null,
   disconnectReason: null,
   disconnectedAt: null,
-  ownerKeyId: req.apiKey.id,
-  ownerKeyName: req.apiKey.name
+  ownerKeyId: owner.id,
+  ownerKeyName: owner.name
   });
 
   await client.initialize();
@@ -804,7 +931,7 @@ async function fetchMedia(url, timeout = 15000) {
   }
 }
 
-app.post('/api/messages/send-video', async (req, res) => {
+app.post('/api/messages/send-video', welcomeQuotaGuard, async (req, res) => {
   const { sessionId, to, caption, videoUrl, videoBase64 } = req.body;
   if (!sessionId || !to) return res.status(400).json({ ok: false, error: 'sessionId and to required' });
   if (!videoUrl && !videoBase64) return res.status(400).json({ ok: false, error: 'videoUrl or videoBase64 required' });
@@ -844,7 +971,7 @@ app.post('/api/messages/send-video', async (req, res) => {
   }
 });
 
-app.post('/api/messages/send-audio', async (req, res) => {
+app.post('/api/messages/send-audio', welcomeQuotaGuard, async (req, res) => {
   const { sessionId, to, audioUrl, audioBase64, asVoice = true } = req.body;
   if (!sessionId || !to) return res.status(400).json({ ok: false, error: 'sessionId and to required' });
   if (!audioUrl && !audioBase64) return res.status(400).json({ ok: false, error: 'audioUrl or audioBase64 required' });
@@ -884,7 +1011,7 @@ app.post('/api/messages/send-audio', async (req, res) => {
   }
 });
 
-app.post('/api/messages/send-file', async (req, res) => {
+app.post('/api/messages/send-file', welcomeQuotaGuard, async (req, res) => {
   const { sessionId, to, caption, fileUrl, fileBase64, fileName } = req.body;
   if (!sessionId || !to) return res.status(400).json({ ok: false, error: 'sessionId and to required' });
   if (!fileUrl && !fileBase64) return res.status(400).json({ ok: false, error: 'fileUrl or fileBase64 required' });
@@ -924,7 +1051,7 @@ app.post('/api/messages/send-file', async (req, res) => {
   }
 });
 
-app.post('/api/messages/send-sticker', async (req, res) => {
+app.post('/api/messages/send-sticker', welcomeQuotaGuard, async (req, res) => {
   const { sessionId, to, stickerUrl, stickerBase64 } = req.body;
   if (!sessionId || !to) return res.status(400).json({ ok: false, error: 'sessionId and to required' });
   if (!stickerUrl && !stickerBase64) return res.status(400).json({ ok: false, error: 'stickerUrl or stickerBase64 required' });
@@ -964,7 +1091,7 @@ app.post('/api/messages/send-sticker', async (req, res) => {
   }
 });
 
-app.post('/api/messages/send-location', async (req, res) => {
+app.post('/api/messages/send-location', welcomeQuotaGuard, async (req, res) => {
   const { sessionId, to, latitude, longitude, description } = req.body;
   if (!sessionId || !to || latitude === undefined || longitude === undefined) return res.status(400).json({ ok: false, error: 'sessionId, to, latitude, longitude required' });
 
@@ -993,7 +1120,7 @@ app.post('/api/messages/send-location', async (req, res) => {
   }
 });
 
-app.post('/api/messages/send-contact', async (req, res) => {
+app.post('/api/messages/send-contact', welcomeQuotaGuard, async (req, res) => {
   const { sessionId, to, contactName, contactNumber } = req.body;
   if (!sessionId || !to || !contactName || !contactNumber) return res.status(400).json({ ok: false, error: 'sessionId, to, contactName, contactNumber required' });
 
@@ -1279,7 +1406,7 @@ app.post('/api/messages/:messageId/edit', async (req, res) => {
   }
   }
   if (!session || !msg) return res.status(404).json({ ok: false, error: 'Message not found' });
-  if (req.apiKey.scope !== 'admin' && session.ownerKeyId && session.ownerKeyId !== req.apiKey.id) {
+  if (req.apiKey.scope !== 'admin' && session.ownerKeyId !== req.apiKey.id) {
   return res.status(403).json({ ok: false, error: "Ce message appartient à une autre clé API." });
   }
 
@@ -1314,7 +1441,7 @@ app.post('/api/messages/:messageId/delete', async (req, res) => {
   }
   }
   if (!session || !msg) return res.status(404).json({ ok: false, error: 'Message not found' });
-  if (req.apiKey.scope !== 'admin' && session.ownerKeyId && session.ownerKeyId !== req.apiKey.id) {
+  if (req.apiKey.scope !== 'admin' && session.ownerKeyId !== req.apiKey.id) {
   return res.status(403).json({ ok: false, error: "Ce message appartient à une autre clé API." });
   }
 
@@ -1468,7 +1595,7 @@ app.post('/api/sessions/close-all', async (req, res) => {
   for (const [sessionId, session] of sessions) {
   // Une clé "standard" ne ferme que ses propres sessions ; seule une clé
   // "admin" peut fermer les sessions de tous les tenants.
-  if (!isAdmin && session.ownerKeyId && session.ownerKeyId !== req.apiKey.id) continue;
+  if (!isAdmin && session.ownerKeyId !== req.apiKey.id) continue;
   try {
   console.log(` Fermeture de la session: ${sessionId} (${session.status})`);
   if (session.client) {
@@ -1494,7 +1621,7 @@ app.post('/api/sessions/cleanup-orphans', async (req, res) => {
   const toDelete = [];
   const isAdmin = req.apiKey.scope === 'admin';
   for (const [sessionId, session] of sessions) {
-  if (!isAdmin && session.ownerKeyId && session.ownerKeyId !== req.apiKey.id) continue;
+  if (!isAdmin && session.ownerKeyId !== req.apiKey.id) continue;
   if (session.status === 'STARTING' && session.createdAt) {
   const age = Date.now() - new Date(session.createdAt).getTime();
   if (age > 120000) toDelete.push({ sessionId, reason: 'STARTING timeout', age });
@@ -1596,7 +1723,7 @@ app.post('/api/sessions/:sessionId/repair', async (req, res) => {
 // ENVOI DE MESSAGE TEXTE (déjà existant)
 // ============================================
 
-app.post('/api/messages/send', async (req, res) => {
+app.post('/api/messages/send', welcomeQuotaGuard, async (req, res) => {
   if (process.env.DEBUG_LOG_BODIES === 'true') {
   console.log('=== REQUETE RECUE ===', redactForLog(req.body));
   }
@@ -1739,7 +1866,7 @@ app.post('/api/messages/send', async (req, res) => {
 // ENVOI D'IMAGE (URL ou Base64) - AFFICHAGE DIRECT
 // ============================================
 
-app.post('/api/messages/send-image', async (req, res) => {
+app.post('/api/messages/send-image', welcomeQuotaGuard, async (req, res) => {
   const { sessionId, to, caption, imageUrl, imageBase64 } = req.body;
 
   if (!sessionId || !to) {
@@ -1891,7 +2018,7 @@ app.get('/api/sessions/:sessionId/messages/status/:status', (req, res) => {
 // STATS & HEALTH
 // ============================================
 
-app.get('/api/stats', (req, res) => {
+app.get('/api/stats', requireAdmin, (req, res) => {
   const stats = {
   activeSessions: sessions.size,
   trackedMessages: messageTracking.size,
