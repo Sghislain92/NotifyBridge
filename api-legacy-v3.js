@@ -231,6 +231,8 @@ const puppeteerConfig = {
 // STOCKAGE DES SESSIONS ET MESSAGES
 // ============================================
 const sessions = new Map();
+// Verrou mémoire : un seul initialize() simultané par profil LocalAuth.
+const initializingSessions = new Map();
 const messageTracking = new Map();
 // Propriétaire logique de chaque session; la connexion WhatsApp est persistée
 // sur disque et ce mapping doit donc survivre aux redémarrages Railway.
@@ -726,88 +728,108 @@ async function createClient(sessionId) {
 
 app.post('/api/sessions/:sessionId/start', startLimiter, async (req, res) => {
   const { sessionId } = req.params;
+  if (initializingSessions.has(sessionId)) {
+    return res.status(202).json({
+      ok: true,
+      starting: true,
+      message: 'Initialisation déjà en cours pour cette session',
+      sessionId
+    });
+  }
+
   try {
-  if (sessions.has(sessionId)) {
-  const session = sessions.get(sessionId);
-  // Si la session est déjà pleinement connectée, on ne touche à rien
-  // (c'est l'appel idempotent normal pendant qu'on affiche le tableau de
-  // bord). Dans tout autre état (bloquée en SCAN_QR périmé, AUTHENTICATED
-  // qui ne termine jamais, AUTH_FAILURE, DISCONNECTED...), on repart d'une
-  // session neuve plutôt que de renvoyer indéfiniment un QR mort : c'est
-  // ce blocage qui empêchait de se reconnecter après un échec.
-  if (session.status === 'WORKING') {
-  return res.json({
-  ok: true,
-  message: 'Session déjà en cours',
-  sessionId,
-  phoneNumber: session.phoneNumber || null,
-  pushname: session.contactInfo?.pushname || null
-  });
-  }
-  console.log(`[${sessionId}] Session bloquée en statut ${session.status} : redémarrage complet`);
-  try {
-  await session.client.destroy();
-  } catch (e) {
-  console.log(`[${sessionId}] Erreur destroy avant redémarrage (ignorée) : ${e.message}`);
-  }
-  sessions.delete(sessionId);
-  }
+    if (sessions.has(sessionId)) {
+      const session = sessions.get(sessionId);
+      if (session.status === 'WORKING') {
+        return res.json({
+          ok: true,
+          message: 'Session déjà en cours',
+          sessionId,
+          phoneNumber: session.phoneNumber || null,
+          pushname: session.contactInfo?.pushname || null
+        });
+      }
+      console.log(`[${sessionId}] Session bloquée en statut ${session.status} : redémarrage complet`);
+      try { await session.client.destroy(); } catch (e) {
+        console.log(`[${sessionId}] Erreur destroy avant redémarrage (ignorée) : ${e.message}`);
+      }
+      sessions.delete(sessionId);
+    }
 
-  const ownerWasRecorded = Object.prototype.hasOwnProperty.call(sessionOwners, sessionId);
-  let owner = ownerWasRecorded
-    ? apiKeyStore.getActiveKeyMetadata(sessionOwners[sessionId].ownerKeyId)
-    : null;
-  if (ownerWasRecorded && !owner && req.apiKey.scope !== 'admin') {
-    return res.status(403).json({ ok: false, error: 'Le propriétaire précédent de cette session est révoqué; un administrateur doit réattribuer la session.' });
-  }
-  if (owner && req.apiKey.scope !== 'admin' && owner.id !== req.apiKey.id) {
-    return res.status(403).json({ ok: false, error: 'Cette session appartient à une autre clé API.' });
-  }
-  if (!owner) owner = { id: req.apiKey.id, name: req.apiKey.name };
-  sessionOwners[sessionId] = { ownerKeyId: owner.id, ownerKeyName: owner.name };
-  try {
-    persistSessionOwners();
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: 'Impossible de persister le propriétaire de session.' });
-  }
+    const ownerWasRecorded = Object.prototype.hasOwnProperty.call(sessionOwners, sessionId);
+    let owner = ownerWasRecorded
+      ? apiKeyStore.getActiveKeyMetadata(sessionOwners[sessionId].ownerKeyId)
+      : null;
+    if (ownerWasRecorded && !owner && req.apiKey.scope !== 'admin') {
+      return res.status(403).json({ ok: false, error: 'Le propriétaire précédent de cette session est révoqué; un administrateur doit réattribuer la session.' });
+    }
+    if (owner && req.apiKey.scope !== 'admin' && owner.id !== req.apiKey.id) {
+      return res.status(403).json({ ok: false, error: 'Cette session appartient à une autre clé API.' });
+    }
+    if (!owner) owner = { id: req.apiKey.id, name: req.apiKey.name };
 
-  if (sessions.size >= MAX_SESSIONS_TOTAL) {
-  return res.status(429).json({ ok: false, error: `Limite globale de sessions atteinte (${MAX_SESSIONS_TOTAL}).` });
-  }
-  if (req.apiKey.scope !== 'admin' && countSessionsOwnedBy(req.apiKey.id) >= MAX_SESSIONS_PER_KEY) {
-  return res.status(429).json({ ok: false, error: `Limite de sessions atteinte pour cette clé API (${MAX_SESSIONS_PER_KEY}). Fermez une session existante avant d'en créer une nouvelle.` });
-  }
+    if (sessions.size >= MAX_SESSIONS_TOTAL) {
+      return res.status(429).json({ ok: false, error: `Limite globale de sessions atteinte (${MAX_SESSIONS_TOTAL}).` });
+    }
+    if (req.apiKey.scope !== 'admin' && countSessionsOwnedBy(req.apiKey.id) >= MAX_SESSIONS_PER_KEY) {
+      return res.status(429).json({ ok: false, error: `Limite de sessions atteinte pour cette clé API (${MAX_SESSIONS_PER_KEY}). Fermez une session existante avant d'en créer une nouvelle.` });
+    }
 
-  const client = await createClient(sessionId);
-  sessions.set(sessionId, {
-  client,
-  status: 'STARTING',
-  qr: null,
-  phoneNumber: null,
-  createdAt: new Date().toISOString(),
-  lastActivity: Date.now(),
-  messagesCount: 0,
-  error: null,
-  userInfo: null,
-  contactInfo: null,
-  disconnectReason: null,
-  disconnectedAt: null,
-  ownerKeyId: owner.id,
-  ownerKeyName: owner.name
-  });
+    sessionOwners[sessionId] = { ownerKeyId: owner.id, ownerKeyName: owner.name };
+    try {
+      persistSessionOwners();
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: 'Impossible de persister le propriétaire de session.' });
+    }
 
-  await client.initialize();
+    const client = await createClient(sessionId);
+    const session = {
+      client,
+      status: 'STARTING',
+      qr: null,
+      phoneNumber: null,
+      createdAt: new Date().toISOString(),
+      lastActivity: Date.now(),
+      messagesCount: 0,
+      error: null,
+      userInfo: null,
+      contactInfo: null,
+      disconnectReason: null,
+      disconnectedAt: null,
+      ownerKeyId: owner.id,
+      ownerKeyName: owner.name
+    };
+    // Enregistrer AVANT initialize() : les événements QR/auth/erreur peuvent
+    // arriver pendant l'initialisation et les appels concurrents sont bloqués.
+    sessions.set(sessionId, session);
 
-  res.json({
-  ok: true,
-  message: 'Initialisation de la session WhatsApp lancée en mode Stealth',
-  sessionId,
-  phoneNumber: null,
-  pushname: null
-  });
+    const initialisation = client.initialize()
+      .catch(async (error) => {
+        console.error(`[${sessionId}] Échec initialisation Chrome/WhatsApp:`, error.message);
+        session.status = 'START_FAILURE';
+        session.error = error.message;
+        session.lastActivity = Date.now();
+        if (sessions.get(sessionId)?.client === client) sessions.delete(sessionId);
+        try { await client.destroy(); } catch (destroyError) {
+          console.error(`[${sessionId}] Nettoyage après échec impossible:`, destroyError.message);
+        }
+      })
+      .finally(() => initializingSessions.delete(sessionId));
+    initializingSessions.set(sessionId, initialisation);
+
+    // Ne pas garder la requête PHP ouverte pendant le lancement de Chrome.
+    return res.status(202).json({
+      ok: true,
+      starting: true,
+      message: 'Initialisation de la session WhatsApp lancée',
+      sessionId,
+      phoneNumber: null,
+      pushname: null
+    });
   } catch (error) {
-  console.error(`[${sessionId}] Erreur:`, error.message);
-  res.status(500).json({ ok: false, error: error.message });
+    console.error(`[${sessionId}] Erreur démarrage:`, error.message);
+    initializingSessions.delete(sessionId);
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
