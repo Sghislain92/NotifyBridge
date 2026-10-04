@@ -82,7 +82,8 @@ L'API déployée sur `notifybridge-production.up.railway.app` n'appliquait **auc
 ### 3.10 Conteneur Docker
 - Utilisateur non-root dédié (`notifybridge`).
 - `HEALTHCHECK` basé sur `/api/health`.
-- Volume recommandé sur `/app/data` (clés API) et `/app/.wwebjs_auth` (sessions WhatsApp) pour la persistance entre redéploiements Railway.
+- Volume persistant utilisé par les clés API et les sessions LocalAuth : `/app/data`, les profils étant dans `/app/data/wwebjs_auth` lorsque `API_KEYS_DIR=/app/data`.
+- Une seule réplique/processus API doit utiliser ces profils WhatsApp; un profil Chromium simultanément ouvert ailleurs échoue avec `The profile appears to be in use by another Google Chrome process`. Ne supprimer les verrous `Singleton*` qu’après arrêt vérifié de l’ancien processus, et ne pas supprimer les données LocalAuth.
 
 ## 4. Ce qui reste de la responsabilité de l'opérateur
 

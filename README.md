@@ -68,7 +68,9 @@ npm install
 npm start
 ```
 
-Sur Railway : conserver un volume monté pour `/app/data` et `.wwebjs_auth`, définir les variables dans **Service → Variables**, puis déployer les fichiers du dépôt. Après une rotation de `ADMIN_API_KEY`, mettre également à jour le fichier privé `.config/notifybridge-dashboard.php` du dashboard et redémarrer les services concernés.
+Sur Railway : conserver **un volume persistant monté sur `/app/data`**. Les clés et propriétaires sont stockés directement dans ce dossier; `LocalAuth` utilise le sous-dossier `/app/data/wwebjs_auth` quand `API_KEYS_DIR=/app/data` — il ne faut pas monter un second volume `.wwebjs_auth` pour ce code. Définir les variables dans **Service → Variables**.
+
+**Utiliser une seule réplique API pour les sessions WhatsApp.** Deux processus Chromium ne doivent pas ouvrir simultanément le même profil LocalAuth. Les déploiements concurrents, plusieurs répliques ou un ancien processus toujours actif peuvent produire `The profile appears to be in use by another Google Chrome process`. Après avoir confirmé que l’ancien processus est arrêté, retirer uniquement les fichiers de verrou `SingletonLock`, `SingletonSocket` et `SingletonCookie` du profil concerné si le verrou est resté bloqué; ne pas supprimer le dossier d’authentification WhatsApp. Après une rotation de `ADMIN_API_KEY`, mettre également à jour le fichier privé `.config/notifybridge-dashboard.php` du dashboard et redémarrer les services concernés.
 
 ## Routes principales
 
